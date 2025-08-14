@@ -1,21 +1,18 @@
 use solana_copytrading_bot::{
-    common::{config::Config, constants::RUN_MSG},
+    common::{config::Config, logger::init_logger},
     engine::monitor::copytrader,
 };
 
 #[tokio::main]
 async fn main() {
-    /* Initial Settings */
+    // Load config
     let config = Config::new().await;
 
-    /* Running Bot */
-    let run_msg = RUN_MSG;
-    println!("{}", run_msg);
+    // Init logger
+    init_logger(&config.log_format);
 
-    copytrader(
-        &config.rpc_wss,
-        config.app_state,
-        config.swap_config,
-    )
-    .await;
+    println!("Starting Solana Copy Trading Bot");
+
+    // Run bot
+    copytrader(&config).await;
 }
