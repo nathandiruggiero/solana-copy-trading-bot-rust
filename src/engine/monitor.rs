@@ -147,14 +147,23 @@ async fn fetch_and_parse(
 		.find_map(|l| l.strip_prefix("Program log: Instruction: "))
 		.map(|s| s.to_string());
 
+	// Only accept Buy*/Sell* classes when present
+	let is_buy_sell = instruction_type
+		.as_deref()
+		.map(|s| s.starts_with("Buy") || s.starts_with("Sell"))
+		.unwrap_or(false);
+
+	// Priority fee from ComputeBudget logs (CU price × CU consumed)
 	let cu_price_micro = extract_cu_price_micro_from_logs(&logs);
 	let priority_lamports = cu_price_micro
 		.map(|micro| micro.saturating_mul(compute_units_consumed))
 		.map(|micro_total| micro_total / 1_000_000)
 		.unwrap_or(0);
 
+	// Mint from token balance changes
 	let mint = extract_mint_from_balances(meta);
 
+	// Direction and amounts from balances
 	let pre_sol = meta.pre_balances.first().copied().unwrap_or(0) as i128;
 	let post_sol = meta.post_balances.first().copied().unwrap_or(0) as i128;
 	let input_sol = if post_sol < pre_sol {
@@ -173,6 +182,11 @@ async fn fetch_and_parse(
 	} else {
 		None
 	};
+
+	// Final filter: require either explicit Buy*/Sell* instruction or a resolved direction
+	if !is_buy_sell && direction.is_none() {
+		return Err(anyhow!("filtered: not a buy/sell instruction"));
+	}
 
 	Ok(TransactionMetadata {
 		signature: signature.to_string(),
