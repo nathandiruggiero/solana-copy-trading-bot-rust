@@ -7,7 +7,7 @@ use solana_client::rpc_config::RpcTransactionConfig;
 use solana_sdk::{
 	commitment_config::CommitmentConfig,
 	pubkey::Pubkey,
-	signature::Signature,
+	signature::{Keypair, Signature, Signer},
 };
 use solana_transaction_status::{
 	option_serializer::OptionSerializer, UiTransactionEncoding, UiTransactionStatusMeta,
@@ -47,11 +47,15 @@ pub async fn copytrader(config: &Config) {
 	let recent_signatures: Arc<RwLock<VecDeque<(String, Instant)>>> =
 		Arc::new(RwLock::new(VecDeque::with_capacity(20_000)));
 
+	// Derive our wallet pubkey from PRIVATE_KEY once for sizing decisions
+	let wallet_keypair = Keypair::from_base58_string(&config.private_key);
+	let our_wallet_pubkey = wallet_keypair.pubkey();
+
 	info!("Polling signatures for {} wallets (confirmed)", target_wallets.len());
 
 	loop {
 		for wallet in target_wallets.iter() {
-			if let Err(e) = poll_wallet_push(&rpc_client, wallet, &recent_signatures).await {
+			if let Err(e) = poll_wallet_push(&rpc_client, wallet, &recent_signatures, config, &our_wallet_pubkey).await {
 				error!("poll error {}: {}", wallet, e);
 			}
 			// brief pause between wallets to avoid rate limits
@@ -66,6 +70,8 @@ async fn poll_wallet_push(
 	rpc_client: &RpcClient,
 	wallet: &Pubkey,
 	recent: &Arc<RwLock<VecDeque<(String, Instant)>>>,
+	config: &Config,
+	our_wallet_pubkey: &Pubkey,
 ) -> Result<()> {
 	let cfg = GetConfirmedSignaturesForAddress2Config {
 		before: None,
@@ -82,11 +88,71 @@ async fn poll_wallet_push(
 			let sig_parsed = Signature::from_str(&sig)?;
 			match fetch_and_parse(rpc_client, &sig_parsed).await {
 				Ok(md) => {
+					// Base classification log
 					log_transaction_metadata(&md);
-					// DRY_RUN: only log copy intent
-					info!("[COPY-INTENT] Would copy {} for mint {:?}", md.direction.as_deref().unwrap_or("Unknown"), md.mint);
+
+					// Fee-greater-or-equal-than-input guard (Buy: input SOL must be > total fees)
+					let total_fee_sol = (md.tx_fee_lamports + md.priority_lamports) as f64 / 1_000_000_000.0;
+					let fee_ge_input = match (md.direction.as_deref(), md.input_sol) {
+						(Some("Buy"), Some(inp)) => inp <= total_fee_sol + 1e-9,
+						_ => false,
+					};
+					if fee_ge_input {
+						info!(
+							"[DECISION] action=pass reason=fee_ge_input signature={} input_sol={:.9} total_fee_sol={:.9}",
+							md.signature,
+							md.input_sol.unwrap_or(0.0),
+							total_fee_sol
+						);
+						continue;
+					}
+
+					// Decide to copy or pass: require mint and direction
+					let should_copy = md.mint.is_some() && md.direction.is_some();
+					if should_copy {
+						if config.dry_run {
+							info!(
+								"[DECISION] action=copy dry_run=true signature={} mint={:?} direction={:?}",
+								md.signature, md.mint, md.direction
+							);
+							// Compute planned amounts
+							if let Some(dir) = md.direction.as_deref() {
+								match dir {
+									"Buy" => {
+										let planned = crate::engine::swap::calculate_buy_lamports(&rpc_client, our_wallet_pubkey, config).await.unwrap_or(0);
+										info!("[COPY-PLAN] buy_lamports={} (~{:.6} SOL)", planned, planned as f64 / 1_000_000_000.0);
+									}
+									"Sell" => {
+										if let Some(mint_str) = &md.mint { if let Ok(m) = Pubkey::from_str(mint_str) {
+											let full_amt = crate::engine::swap::calculate_full_sell_amount(&rpc_client, our_wallet_pubkey, &m).await.unwrap_or(0);
+											info!("[COPY-PLAN] sell_amount_raw={} (full token balance)", full_amt);
+										}}
+									}
+									_ => {}
+								}
+							}
+						} else {
+							info!(
+								"[DECISION] action=copy dry_run=false signature={} mint={:?} direction={:?}",
+								md.signature, md.mint, md.direction
+							);
+							// execute_copy_trade(...) would be called here in live mode
+						}
+					} else {
+						info!(
+							"[DECISION] action=pass reason=missing_required_fields signature={} mint={:?} direction={:?}",
+							md.signature, md.mint, md.direction
+						);
+					}
 				}
-				Err(e) => error!("parse error for {}: {}", sig, e),
+				Err(e) => {
+					let msg = e.to_string();
+					if msg.starts_with("filtered:") {
+						info!("[DECISION] action=pass reason={} signature={}", msg, sig);
+					} else {
+						error!("parse error for {}: {}", sig, msg);
+					}
+				}
 			}
 		}
 	}
