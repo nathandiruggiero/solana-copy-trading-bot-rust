@@ -1,6 +1,6 @@
 use chrono::{Local, Utc};
 use env_logger::Builder;
-use log::Level;
+use log::LevelFilter;
 use std::io::Write;
 
 const LOG_LEVEL: &str = "LOG";
@@ -58,6 +58,8 @@ impl LogLevel<'_> {
 
 pub fn init_logger(format: &str) {
     let mut builder = Builder::from_default_env();
+    // Default to INFO if RUST_LOG not provided
+    builder.filter_level(LevelFilter::Info);
     match format {
         "json" => {
             builder.format(|buf, record| {

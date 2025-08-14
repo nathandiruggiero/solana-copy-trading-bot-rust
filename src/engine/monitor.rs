@@ -40,29 +40,29 @@ pub async fn copytrader(config: &Config) {
 
 	let rpc_client = RpcClient::new_with_commitment(
 		config.rpc_https.clone(),
-		CommitmentConfig::processed(),
+		CommitmentConfig::confirmed(),
 	);
 
 	let target_wallets: Arc<Vec<Pubkey>> = Arc::new(config.target_wallets.clone());
 	let recent_signatures: Arc<RwLock<VecDeque<(String, Instant)>>> =
 		Arc::new(RwLock::new(VecDeque::with_capacity(20_000)));
 
-	info!("Polling signatures for {} wallets", target_wallets.len());
+	info!("Polling signatures for {} wallets (confirmed)", target_wallets.len());
 
 	loop {
 		for wallet in target_wallets.iter() {
-			if let Err(e) = poll_wallet(&rpc_client, wallet, &recent_signatures).await {
+			if let Err(e) = poll_wallet_push(&rpc_client, wallet, &recent_signatures).await {
 				error!("poll error {}: {}", wallet, e);
 			}
 			// brief pause between wallets to avoid rate limits
-			sleep(Duration::from_millis(50)).await;
+			sleep(Duration::from_millis(150)).await;
 		}
 		// short cycle to keep latency low
-		sleep(Duration::from_millis(300)).await;
+		sleep(Duration::from_millis(400)).await;
 	}
 }
 
-async fn poll_wallet(
+async fn poll_wallet_push(
 	rpc_client: &RpcClient,
 	wallet: &Pubkey,
 	recent: &Arc<RwLock<VecDeque<(String, Instant)>>>,
@@ -71,21 +71,23 @@ async fn poll_wallet(
 		before: None,
 		until: None,
 		limit: Some(50),
-		commitment: Some(CommitmentConfig::processed()),
+		commitment: Some(CommitmentConfig::confirmed()),
 	};
 	let sigs = rpc_client
 		.get_signatures_for_address_with_config(wallet, cfg)
 		.await?;
-
 	for s in sigs {
 		let sig = s.signature;
-		if !insert_recent(recent, &sig) {
-			continue;
-		}
-		let sig_parsed = Signature::from_str(&sig)?;
-		match fetch_and_parse(rpc_client, &sig_parsed).await {
-			Ok(md) => log_transaction_metadata(&md),
-			Err(e) => error!("parse error for {}: {}", sig, e),
+		if insert_recent(recent, &sig) {
+			let sig_parsed = Signature::from_str(&sig)?;
+			match fetch_and_parse(rpc_client, &sig_parsed).await {
+				Ok(md) => {
+					log_transaction_metadata(&md);
+					// DRY_RUN: only log copy intent
+					info!("[COPY-INTENT] Would copy {} for mint {:?}", md.direction.as_deref().unwrap_or("Unknown"), md.mint);
+				}
+				Err(e) => error!("parse error for {}: {}", sig, e),
+			}
 		}
 	}
 	Ok(())
@@ -136,7 +138,6 @@ async fn fetch_and_parse(
 		_ => 0,
 	};
 
-	// Instruction type from logs
 	let logs: Vec<String> = match &meta.log_messages {
 		OptionSerializer::Some(v) => v.clone(),
 		_ => Vec::new(),
@@ -146,17 +147,14 @@ async fn fetch_and_parse(
 		.find_map(|l| l.strip_prefix("Program log: Instruction: "))
 		.map(|s| s.to_string());
 
-	// Priority fee (CU price × CU consumed) parsed from logs if present
 	let cu_price_micro = extract_cu_price_micro_from_logs(&logs);
 	let priority_lamports = cu_price_micro
 		.map(|micro| micro.saturating_mul(compute_units_consumed))
 		.map(|micro_total| micro_total / 1_000_000)
 		.unwrap_or(0);
 
-	// Mint from token balance changes
 	let mint = extract_mint_from_balances(meta);
 
-	// Direction and amounts from balances
 	let pre_sol = meta.pre_balances.first().copied().unwrap_or(0) as i128;
 	let post_sol = meta.post_balances.first().copied().unwrap_or(0) as i128;
 	let input_sol = if post_sol < pre_sol {
@@ -192,7 +190,6 @@ async fn fetch_and_parse(
 fn extract_cu_price_micro_from_logs(logs: &[String]) -> Option<u64> {
 	for l in logs {
 		if l.contains("SetComputeUnitPrice") {
-			// naive parse: extract last integer segment
 			let digits: String = l.chars().filter(|c| c.is_ascii_digit()).collect();
 			if let Ok(v) = digits.parse::<u64>() { return Some(v); }
 		}
@@ -242,35 +239,14 @@ fn log_transaction_metadata(md: &TransactionMetadata) {
 		.as_ref()
 		.map(|s| s.as_str())
 		.unwrap_or("Unknown");
-	let icon = if instr.contains("Buy") {
-		":grand_cercle_vert:"
-	} else if instr.contains("Sell") {
-		":grand_cercle_rouge:"
-	} else {
-		":point_d_interrogation:"
-	};
+	let icon = if instr.contains("Buy") { ":grand_cercle_vert:" } else if instr.contains("Sell") { ":grand_cercle_rouge:" } else { ":point_d_interrogation:" };
 
 	info!("[{}] [COPY-BOT] => {} Detected {}", ts, icon, instr);
-	if let Some(m) = &md.mint {
-		info!("   ↳ Mint: {}", m);
-	}
-	if let Some(sol) = md.input_sol {
-		info!("   ↳ Input: {:.6} SOL", sol);
-	}
-	if let Some(tok) = md.output_tokens {
-		info!("   ↳ Tokens: {:.6}", tok);
-	}
-	if let (Some(sol), Some(tok)) = (md.input_sol, md.output_tokens) {
-		if tok > 0.0 {
-			info!("   ↳ Price: {:.8} SOL/token", sol / tok);
-		}
-	}
+	if let Some(m) = &md.mint { info!("   ↳ Mint: {}", m); }
+	if let Some(sol) = md.input_sol { info!("   ↳ Input: {:.6} SOL", sol); }
+	if let Some(tok) = md.output_tokens { info!("   ↳ Tokens: {:.6}", tok); }
+	if let (Some(sol), Some(tok)) = (md.input_sol, md.output_tokens) { if tok > 0.0 { info!("   ↳ Price: {:.8} SOL/token", sol / tok); } }
 	let fee_sol = md.tx_fee_lamports as f64 / 1_000_000_000.0;
 	let pri_sol = md.priority_lamports as f64 / 1_000_000_000.0;
-	info!(
-		"   ↳ Fee: {:.6} SOL | Priority: {:.6} SOL | Total: {:.6} SOL",
-		fee_sol,
-		pri_sol,
-		fee_sol + pri_sol
-	);
+	info!("   ↳ Fee: {:.6} SOL | Priority: {:.6} SOL | Total: {:.6} SOL", fee_sol, pri_sol, fee_sol + pri_sol);
 } 

@@ -20,6 +20,7 @@ pub struct Config {
     pub trade_percentage: f64,
     pub slippage: f64,
     pub log_format: String,
+    pub dry_run: bool,
 }
 
 impl Config {
@@ -34,6 +35,7 @@ impl Config {
         let trade_percentage_str = env::var("TOKEN_PERCENTAGE").unwrap_or_else(|_| "1".to_string());
         let slippage_str = env::var("SLIPPAGE").unwrap_or_else(|_| "10".to_string());
         let log_format = env::var("LOG_FORMAT").unwrap_or_else(|_| "pretty".to_string());
+        let dry_run = env::var("DRY_RUN").unwrap_or_else(|_| "true".to_string()).to_lowercase() == "true";
         
         let trade_percentage = trade_percentage_str.parse::<f64>().unwrap_or(1.0) / 100.0; // Convert percentage to decimal
         let slippage = slippage_str.parse::<f64>().unwrap_or(10.0) / 100.0; // Convert percentage to decimal
@@ -44,7 +46,7 @@ impl Config {
             vec![Pubkey::from_str("8uvia8bNfEHFaxcEpg5uLJoTXJoZ9frsfgBU6JemUgNt").unwrap()]
         });
         
-        info!("Configuration loaded: RPC HTTPS={}, WSS={}, Trade Percentage={}%, Slippage={}%, LogFormat={}", rpc_https, rpc_wss, trade_percentage * 100.0, slippage * 100.0, &log_format);
+        info!("Configuration loaded: RPC HTTPS={}, WSS={}, Trade Percentage={}%, Slippage={}%, LogFormat={}, DryRun={}", rpc_https, rpc_wss, trade_percentage * 100.0, slippage * 100.0, &log_format, dry_run);
         
         Config {
             rpc_https,
@@ -54,6 +56,7 @@ impl Config {
             trade_percentage,
             slippage,
             log_format,
+            dry_run,
         }
     }
 }
