@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use chrono::Utc;
 use log::{error, info};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
@@ -152,7 +151,26 @@ async fn poll_wallet_push(
 								"[DECISION] action=copy dry_run=false signature={} mint={:?} direction={:?}",
 								md.signature, md.mint, md.direction
 							);
-							// execute_copy_trade(...) would be called here in live mode
+							// Option A: Fetch prebuilt Pump.fun tx, sign and send
+							if let (Some(dir), Some(mint_str)) = (md.direction.as_deref(), md.mint.as_deref()) {
+								let http = reqwest::Client::new();
+								let payer = Keypair::from_base58_string(&config.private_key);
+								let in_amount = if dir == "Buy" {
+									crate::engine::swap::calculate_buy_lamports(&rpc_client, our_wallet_pubkey, config).await.unwrap_or(0)
+								} else { 0 };
+								let trade_type = if dir == "Buy" { "BUY" } else { "SELL" };
+								// Endpoint comes from env via RPC_HTTPS or separate METIS endpoint; reuse RPC_HTTPS if not provided
+								let endpoint = std::env::var("METIS_ENDPOINT").unwrap_or_else(|_| "https://public.jupiterapi.com/pump-fun/swap".to_string());
+								match crate::engine::swap::fetch_pumpfun_swap_tx(&http, &endpoint, &our_wallet_pubkey.to_string(), trade_type, mint_str, in_amount, (config.slippage * 10_000.0) as u32, Some("auto")).await {
+									Ok(mut vtx) => {
+										match crate::engine::swap::sign_and_send(&rpc_client, &mut vtx, &payer).await {
+											Ok(sent_sig) => info!("[COPY-SENT] original={} copy_sig={}", md.signature, sent_sig),
+											Err(e) => error!("send error for original {}: {}", md.signature, e),
+										}
+									}
+									Err(e) => error!("fetch swap tx error for original {}: {}", md.signature, e),
+								}
+							}
 						}
 					} else {
 						info!(

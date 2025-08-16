@@ -3469,13 +3469,14 @@ name = "solana-copytrading-bot"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.21.7",
+ "bincode",
  "borsh 0.10.4",
  "borsh-derive 0.10.4",
  "bytemuck",
  "chrono",
  "dotenv",
  "env_logger 0.10.2",
- "futures-util",
  "log",
  "lru",
  "reqwest",
