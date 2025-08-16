@@ -9,6 +9,7 @@ use solana_sdk::{
 	pubkey::Pubkey,
 	signature::{Keypair, Signature, Signer},
 };
+use spl_associated_token_account::get_associated_token_address;
 use solana_transaction_status::{
 	option_serializer::OptionSerializer, UiTransactionEncoding, UiTransactionStatusMeta,
 };
@@ -22,6 +23,8 @@ use tokio::time::sleep;
 
 use crate::common::config::Config;
 
+const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+
 #[derive(Debug, Clone)]
 pub struct TransactionMetadata {
 	pub signature: String,
@@ -30,9 +33,11 @@ pub struct TransactionMetadata {
 	pub direction: Option<String>,
 	pub input_sol: Option<f64>,
 	pub output_tokens: Option<f64>,
+	pub output_sol: Option<f64>,
 	pub tx_fee_lamports: u64,
 	pub priority_lamports: u64,
 	pub compute_units_consumed: u64,
+	pub elapsed_ms: u128,
 }
 
 pub async fn copytrader(config: &Config) {
@@ -110,26 +115,37 @@ async fn poll_wallet_push(
 					// Decide to copy or pass: require mint and direction
 					let should_copy = md.mint.is_some() && md.direction.is_some();
 					if should_copy {
+						// Compute planned amounts and estimated fees for our copy
+						let (planned_info, ata_info) = if let Some(dir) = md.direction.as_deref() {
+							match dir {
+								"Buy" => {
+									let planned_lamports = crate::engine::swap::calculate_buy_lamports(&rpc_client, our_wallet_pubkey, config).await.unwrap_or(0);
+									let planned_sol = planned_lamports as f64 / 1_000_000_000.0;
+									// Estimate CU price from observed tx (avoid divide-by-zero)
+									let unit_price_micro = if md.compute_units_consumed > 0 { (md.priority_lamports.saturating_mul(1_000_000)) / md.compute_units_consumed } else { 0 };
+									let est_priority_lamports = if md.compute_units_consumed > 0 { (unit_price_micro.saturating_mul(md.compute_units_consumed)) / 1_000_000 } else { 0 };
+									let est_total_fee_sol = (5_000u64 + est_priority_lamports) as f64 / 1_000_000_000.0;
+									// ATA for mint
+									let ata_str = if let Some(mint_str) = &md.mint { if let Ok(m) = Pubkey::from_str(mint_str) { get_associated_token_address(our_wallet_pubkey, &m).to_string() } else { "Unknown".to_string() } } else { "Unknown".to_string() };
+									(Some((planned_sol, est_total_fee_sol, unit_price_micro)), Some(ata_str))
+								}
+								"Sell" => {
+									let ata_str = if let Some(mint_str) = &md.mint { if let Ok(m) = Pubkey::from_str(mint_str) { get_associated_token_address(our_wallet_pubkey, &m).to_string() } else { "Unknown".to_string() } } else { "Unknown".to_string() };
+									(None, Some(ata_str))
+								}
+								_ => (None, None)
+							}
+						} else { (None, None) };
+
 						if config.dry_run {
 							info!(
 								"[DECISION] action=copy dry_run=true signature={} mint={:?} direction={:?}",
 								md.signature, md.mint, md.direction
 							);
-							// Compute planned amounts
-							if let Some(dir) = md.direction.as_deref() {
-								match dir {
-									"Buy" => {
-										let planned = crate::engine::swap::calculate_buy_lamports(&rpc_client, our_wallet_pubkey, config).await.unwrap_or(0);
-										info!("[COPY-PLAN] buy_lamports={} (~{:.6} SOL)", planned, planned as f64 / 1_000_000_000.0);
-									}
-									"Sell" => {
-										if let Some(mint_str) = &md.mint { if let Ok(m) = Pubkey::from_str(mint_str) {
-											let full_amt = crate::engine::swap::calculate_full_sell_amount(&rpc_client, our_wallet_pubkey, &m).await.unwrap_or(0);
-											info!("[COPY-PLAN] sell_amount_raw={} (full token balance)", full_amt);
-										}}
-									}
-									_ => {}
-								}
+							if let Some((planned_sol, est_fee_sol, unit_price_micro)) = planned_info {
+								info!("[COPY-INTENT] wallet={} dir=Buy amount={:.6} SOL est_fees={:.9} SOL cu_price_micro={} ata={}", our_wallet_pubkey, planned_sol, est_fee_sol, unit_price_micro, ata_info.unwrap_or_else(|| "Unknown".to_string()));
+							} else if md.direction.as_deref() == Some("Sell") {
+								info!("[COPY-INTENT] wallet={} dir=Sell sell_all_tokens_of_mint={:?} ata={}", our_wallet_pubkey, md.mint, ata_info.unwrap_or_else(|| "Unknown".to_string()));
 							}
 						} else {
 							info!(
@@ -183,6 +199,7 @@ async fn fetch_and_parse(
 	rpc_client: &RpcClient,
 	signature: &Signature,
 ) -> Result<TransactionMetadata> {
+	let started = Instant::now();
 	let cfg = RpcTransactionConfig {
 		encoding: Some(UiTransactionEncoding::JsonParsed),
 		max_supported_transaction_version: Some(0),
@@ -208,51 +225,45 @@ async fn fetch_and_parse(
 		OptionSerializer::Some(v) => v.clone(),
 		_ => Vec::new(),
 	};
+
+	// Must be Pump.fun program logs
+	let pump_present = logs.iter().any(|l| l.contains(PUMP_FUN_PROGRAM_ID));
+	if !pump_present { return Err(anyhow!("filtered: not pump.fun")); }
+
+	// Instruction type parsing
 	let instruction_type = logs
 		.iter()
 		.find_map(|l| l.strip_prefix("Program log: Instruction: "))
 		.map(|s| s.to_string());
 
-	// Only accept Buy*/Sell* classes when present
-	let is_buy_sell = instruction_type
+	// Only accept: Buy, Sell, BuyExactIn, SellExactIn
+	let is_allowed = instruction_type
 		.as_deref()
-		.map(|s| s.starts_with("Buy") || s.starts_with("Sell"))
+		.map(|s| matches!(s, "Buy" | "Sell" | "BuyExactIn" | "SellExactIn"))
 		.unwrap_or(false);
+	if !is_allowed { return Err(anyhow!("filtered: not buy/sell exact")); }
 
-	// Priority fee from ComputeBudget logs (CU price × CU consumed)
+	// Priority fee
 	let cu_price_micro = extract_cu_price_micro_from_logs(&logs);
 	let priority_lamports = cu_price_micro
 		.map(|micro| micro.saturating_mul(compute_units_consumed))
 		.map(|micro_total| micro_total / 1_000_000)
 		.unwrap_or(0);
 
-	// Mint from token balance changes
 	let mint = extract_mint_from_balances(meta);
 
-	// Direction and amounts from balances
 	let pre_sol = meta.pre_balances.first().copied().unwrap_or(0) as i128;
 	let post_sol = meta.post_balances.first().copied().unwrap_or(0) as i128;
-	let input_sol = if post_sol < pre_sol {
-		Some((pre_sol - post_sol) as f64 / 1_000_000_000.0)
-	} else {
-		None
-	};
+	let input_sol = if post_sol < pre_sol { Some((pre_sol - post_sol) as f64 / 1_000_000_000.0) } else { None };
+	let output_sol = if post_sol > pre_sol { Some((post_sol - pre_sol) as f64 / 1_000_000_000.0) } else { None };
 
 	let (output_tokens, direction_token) = extract_token_delta(meta);
-	let direction = if let Some(dir) = direction_token {
-		Some(dir)
-	} else if post_sol < pre_sol {
-		Some("Buy".to_string())
-	} else if post_sol > pre_sol {
-		Some("Sell".to_string())
-	} else {
-		None
-	};
 
-	// Final filter: require either explicit Buy*/Sell* instruction or a resolved direction
-	if !is_buy_sell && direction.is_none() {
-		return Err(anyhow!("filtered: not a buy/sell instruction"));
-	}
+	// Derive direction from instruction type primarily
+	let mut direction = instruction_type.as_deref().map(|s| if s.starts_with("Buy") { "Buy".to_string() } else { "Sell".to_string() });
+	if direction.is_none() { direction = if let Some(dir) = direction_token { Some(dir) } else if post_sol < pre_sol { Some("Buy".to_string()) } else if post_sol > pre_sol { Some("Sell".to_string()) } else { None }; }
+
+	let elapsed_ms = started.elapsed().as_millis();
 
 	Ok(TransactionMetadata {
 		signature: signature.to_string(),
@@ -261,9 +272,11 @@ async fn fetch_and_parse(
 		direction,
 		input_sol,
 		output_tokens,
+		output_sol,
 		tx_fee_lamports,
 		priority_lamports,
 		compute_units_consumed,
+		elapsed_ms,
 	})
 }
 
@@ -313,20 +326,44 @@ fn extract_token_delta(meta: &UiTransactionStatusMeta) -> (Option<f64>, Option<S
 }
 
 fn log_transaction_metadata(md: &TransactionMetadata) {
-	let ts = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-	let instr = md
-		.instruction_type
-		.as_ref()
-		.map(|s| s.as_str())
-		.unwrap_or("Unknown");
-	let icon = if instr.contains("Buy") { ":grand_cercle_vert:" } else if instr.contains("Sell") { ":grand_cercle_rouge:" } else { ":point_d_interrogation:" };
+	// Single-line summary as requested
+	let instr = md.instruction_type.as_deref().unwrap_or("Unknown");
+	let mint = md.mint.as_deref().unwrap_or("Unknown");
+	let total_fee_sol = (md.tx_fee_lamports + md.priority_lamports) as f64 / 1_000_000_000.0;
 
-	info!("[{}] [COPY-BOT] => {} Detected {}", ts, icon, instr);
-	if let Some(m) = &md.mint { info!("   ↳ Mint: {}", m); }
-	if let Some(sol) = md.input_sol { info!("   ↳ Input: {:.6} SOL", sol); }
-	if let Some(tok) = md.output_tokens { info!("   ↳ Tokens: {:.6}", tok); }
-	if let (Some(sol), Some(tok)) = (md.input_sol, md.output_tokens) { if tok > 0.0 { info!("   ↳ Price: {:.8} SOL/token", sol / tok); } }
-	let fee_sol = md.tx_fee_lamports as f64 / 1_000_000_000.0;
-	let pri_sol = md.priority_lamports as f64 / 1_000_000_000.0;
-	info!("   ↳ Fee: {:.6} SOL | Priority: {:.6} SOL | Total: {:.6} SOL", fee_sol, pri_sol, fee_sol + pri_sol);
+	let flow = match md.direction.as_deref() {
+		Some("Buy") => {
+			let left = format_sol(md.input_sol.unwrap_or(0.0));
+			let right = format_tokens(md.output_tokens.unwrap_or(0.0));
+			format!("{} SOL → {} tokens", left, right)
+		}
+		Some("Sell") => {
+			let left = format_tokens(md.output_tokens.unwrap_or(0.0));
+			let right = format_sol(md.output_sol.unwrap_or(0.0));
+			format!("{} tokens → {} SOL", left, right)
+		}
+		_ => "N/A".to_string(),
+	};
+
+	info!(
+		"[BOT] {} | {} | Mint: {} | {} | Fees : {:.9} SOL | t={}ms",
+		md.signature,
+		instr,
+		mint,
+		flow,
+		total_fee_sol,
+		md.elapsed_ms
+	);
+}
+
+fn format_sol(sol: f64) -> String {
+	format!("{:.6}", sol)
+}
+
+fn format_tokens(tokens: f64) -> String {
+	if tokens >= 1000.0 {
+		format!("{:.0}k", tokens / 1000.0)
+	} else {
+		format!("{:.0}", tokens)
+	}
 } 
