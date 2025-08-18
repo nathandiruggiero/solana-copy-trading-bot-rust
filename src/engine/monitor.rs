@@ -52,6 +52,10 @@ struct BotPnlState {
 	invested_sol_by_mint: HashMap<String, f64>,
 	realized_pnl_sol: f64,
 	start_balance_sol: Option<f64>,
+	buy_count: u64,
+	sell_count: u64,
+	total_buy_sol_planned: f64,
+	total_sell_sol_observed: f64,
 }
 
 pub async fn copytrader(config: &Config) {
@@ -116,6 +120,8 @@ pub async fn copytrader(config: &Config) {
 									let planned_sol = planned_lamports as f64 / 1_000_000_000.0;
 									let mut st = pnl_state_ws.write().unwrap();
 									*st.invested_sol_by_mint.entry(mint_key.clone()).or_insert(0.0) += planned_sol;
+									st.buy_count += 1;
+									st.total_buy_sol_planned += planned_sol;
 									let unit_price_micro = if md.compute_units_consumed > 0 { (md.priority_lamports.saturating_mul(1_000_000)) / md.compute_units_consumed } else { 0 };
 									let est_priority_lamports = if md.compute_units_consumed > 0 { (unit_price_micro.saturating_mul(md.compute_units_consumed)) / 1_000_000 } else { 0 };
 									let est_total_fee_sol = (md.tx_fee_lamports + est_priority_lamports) as f64 / 1_000_000_000.0;
@@ -183,7 +189,15 @@ pub async fn copytrader(config: &Config) {
 
 	loop {
 		for wallet in target_wallets.iter() {
-			if let Err(e) = poll_wallet_push(&rpc_client, wallet, &recent_signatures, config, &our_wallet_pubkey, &last_seen).await {
+			if let Err(e) = poll_wallet_push(
+				&rpc_client,
+				wallet,
+				&recent_signatures,
+				config,
+				&our_wallet_pubkey,
+				&last_seen,
+				&pnl_state,
+			).await {
 				error!("poll error {}: {}", wallet, e);
 			}
 			sleep(Duration::from_millis(150)).await;
@@ -232,6 +246,7 @@ async fn poll_wallet_push(
 	config: &Config,
 	our_wallet_pubkey: &Pubkey,
 	last_seen: &Arc<RwLock<HashMap<Pubkey, String>>>,
+	pnl_state: &Arc<RwLock<BotPnlState>>,
 ) -> Result<()> {
 	let cfg = GetConfirmedSignaturesForAddress2Config {
 		before: None,
@@ -305,10 +320,26 @@ async fn poll_wallet_push(
 									let est_total_fee_sol = (5_000u64 + est_priority_lamports) as f64 / 1_000_000_000.0;
 									// ATA for mint
 									let ata_str = if let Some(mint_str) = &md.mint { if let Ok(m) = Pubkey::from_str(mint_str) { spl_associated_token_account::get_associated_token_address(our_wallet_pubkey, &m).to_string() } else { "Unknown".to_string() } } else { "Unknown".to_string() };
+									// PnL counters for dry-run
+									{
+										let mut st = pnl_state.write().unwrap();
+										*st.invested_sol_by_mint.entry(md.mint.clone().unwrap_or_default()).or_insert(0.0) += planned_sol;
+										st.buy_count += 1;
+										st.total_buy_sol_planned += planned_sol;
+									}
 									(Some((planned_sol, est_total_fee_sol, unit_price_micro)), Some(ata_str))
 								}
 								"Sell" => {
 									let ata_str = if let Some(mint_str) = &md.mint { if let Ok(m) = Pubkey::from_str(mint_str) { spl_associated_token_account::get_associated_token_address(our_wallet_pubkey, &m).to_string() } else { "Unknown".to_string() } } else { "Unknown".to_string() };
+									// Realize PnL counters (dry-run) using observed output SOL if present
+									if let Some(out_sol) = md.output_sol {
+										let mut st = pnl_state.write().unwrap();
+										let cost = st.invested_sol_by_mint.remove(&md.mint.clone().unwrap_or_default()).unwrap_or(0.0);
+										let change = out_sol - cost;
+										st.realized_pnl_sol += change;
+										st.sell_count += 1;
+										st.total_sell_sol_observed += out_sol;
+									}
 									(None, Some(ata_str))
 								}
 								_ => (None, None)
@@ -646,12 +677,20 @@ fn start_pnl_logger(rpc_url: String, wallet: Pubkey, pnl_state: Arc<RwLock<BotPn
 				Ok(l) => l as f64 / 1_000_000_000.0,
 				Err(_) => { sleep(Duration::from_secs(30)).await; continue; }
 			};
-			let (start, realized) = {
+			let (start, realized, buys, sells, buy_sol, sell_sol) = {
 				let st = pnl_state.read().unwrap();
-				(st.start_balance_sol.unwrap_or(curr_sol), st.realized_pnl_sol)
+				(
+					st.start_balance_sol.unwrap_or(curr_sol),
+					st.realized_pnl_sol,
+					st.buy_count,
+					st.sell_count,
+					st.total_buy_sol_planned,
+					st.total_sell_sol_observed,
+				)
 			};
 			let delta = curr_sol - start;
-			info!("[PNL-SUMMARY] wallet={} current={:.6} SOL delta_since_start={:.6} SOL realized={:.6} SOL", wallet, curr_sol, delta, realized);
+			let total_trades = buys + sells;
+			info!("[PNL-SUMMARY] wallet={} current={:.6} SOL delta_since_start={:.6} SOL realized={:.6} SOL total_trades={} buys={} ({:.6} SOL) sells={} ({:.6} SOL)", wallet, curr_sol, delta, realized, total_trades, buys, buy_sol, sells, sell_sol);
 			sleep(Duration::from_secs(30)).await;
 		}
 	});
