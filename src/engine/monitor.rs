@@ -22,7 +22,7 @@ use std::{
 use tokio::{sync::mpsc, task::spawn_blocking, time::sleep};
 
 use crate::common::config::Config;
-use crate::engine::swap::calculate_buy_lamports;
+use crate::engine::swap::{calculate_buy_lamports, calculate_full_sell_amount};
 
 const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMP_FUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
@@ -109,26 +109,45 @@ pub async fn copytrader(config: &Config) {
 							let mint_key = md.mint.clone().unwrap_or_default();
 							match md.direction.as_deref() {
 								Some("Buy") => {
-									// Increase cost basis by our planned spend (percentage of wallet)
 									let planned_lamports = calculate_buy_lamports(&rpc_for_ws, &our_wallet_ws, &config_ws).await.unwrap_or(0);
 									let planned_sol = planned_lamports as f64 / 1_000_000_000.0;
 									let mut st = pnl_state_ws.write().unwrap();
 									*st.invested_sol_by_mint.entry(mint_key.clone()).or_insert(0.0) += planned_sol;
-									info!("[PNL] after_buy (planned) mint={} cost+={:.6} SOL", mint_key, planned_sol);
-									info!("[DECISION] action=copy dry_run={} signature={} mint={:?} direction=Buy", config_ws.dry_run, md.signature, md.mint);
+									let unit_price_micro = if md.compute_units_consumed > 0 { (md.priority_lamports.saturating_mul(1_000_000)) / md.compute_units_consumed } else { 0 };
+									let est_priority_lamports = if md.compute_units_consumed > 0 { (unit_price_micro.saturating_mul(md.compute_units_consumed)) / 1_000_000 } else { 0 };
+									let est_total_fee_sol = (md.tx_fee_lamports + est_priority_lamports) as f64 / 1_000_000_000.0;
+									info!(
+										"[DECISION] action=copy dry_run={} wallet={} dir=Buy mint={} planned={:.6} SOL fees_est={:.9} SOL cu_price_micro={} sig={}",
+										config_ws.dry_run,
+										our_wallet_ws,
+										mint_key,
+										planned_sol,
+										est_total_fee_sol,
+										unit_price_micro,
+										md.signature,
+									);
 								}
 								Some("Sell") => {
-									// Realize PnL based on observed SOL out from the target trade (planned copy)
-									if let Some(out_sol) = md.output_sol {
-										let mut st = pnl_state_ws.write().unwrap();
-										let cost = st.invested_sol_by_mint.remove(&mint_key).unwrap_or(0.0);
-										let change = out_sol - cost;
-										st.realized_pnl_sol += change;
-										let start = st.start_balance_sol.unwrap_or(0.0);
-										let sim_balance = start + st.realized_pnl_sol;
-										info!("[PNL] after_sell (planned) mint={} proceeds={:.6} SOL cost={:.6} SOL realized_change={:.6} SOL total_realized={:.6} SOL sim_balance={:.6} SOL", mint_key, out_sol, cost, change, st.realized_pnl_sol, sim_balance);
-									}
-									info!("[DECISION] action=copy dry_run={} signature={} mint={:?} direction=Sell", config_ws.dry_run, md.signature, md.mint);
+									// Fetch our current token raw balance (sum of accounts)
+									let token_raw = if let Ok(mint_pk) = Pubkey::from_str(&mint_key) {
+										calculate_full_sell_amount(&rpc_for_ws, &our_wallet_ws, &mint_pk).await.unwrap_or(0)
+									} else { 0 };
+									let st = pnl_state_ws.read().unwrap();
+									let cost = st.invested_sol_by_mint.get(&mint_key).copied().unwrap_or(0.0);
+									let unit_price_micro = if md.compute_units_consumed > 0 { (md.priority_lamports.saturating_mul(1_000_000)) / md.compute_units_consumed } else { 0 };
+									let est_priority_lamports = if md.compute_units_consumed > 0 { (unit_price_micro.saturating_mul(md.compute_units_consumed)) / 1_000_000 } else { 0 };
+									let est_total_fee_sol = (md.tx_fee_lamports + est_priority_lamports) as f64 / 1_000_000_000.0;
+									info!(
+										"[DECISION] action=copy dry_run={} wallet={} dir=Sell mint={} token_raw={} cost_basis={:.6} SOL fees_est={:.9} SOL cu_price_micro={} sig={}",
+										config_ws.dry_run,
+										our_wallet_ws,
+										mint_key,
+										token_raw,
+										cost,
+										est_total_fee_sol,
+										unit_price_micro,
+										md.signature,
+									);
 								}
 								_ => {}
 							}
@@ -361,9 +380,19 @@ async fn fetch_and_parse(
 		max_supported_transaction_version: Some(0),
 		commitment: Some(CommitmentConfig::confirmed()),
 	};
-	let tx = rpc_client
+	let tx = match rpc_client
 		.get_transaction_with_config(signature, cfg)
-		.await?;
+		.await
+	{
+		Ok(v) => v,
+		Err(e) => {
+			let msg = e.to_string();
+			if msg.contains("invalid type: null") {
+				return Err(anyhow!("filtered: tx_not_available"));
+			}
+			return Err(anyhow!(msg));
+		}
+	};
 
 	let meta: &UiTransactionStatusMeta = tx
 		.transaction
@@ -539,13 +568,15 @@ fn log_transaction_metadata(md: &TransactionMetadata) {
 		_ => "N/A".to_string(),
 	};
 
+	let unit_price_micro = if md.compute_units_consumed > 0 { (md.priority_lamports.saturating_mul(1_000_000)) / md.compute_units_consumed } else { 0 };
 	info!(
-		"[BOT] {} | {} | Mint: {} | {} | Fees : {:.9} SOL | t={}ms",
+		"[BOT] sig={} | {} | mint={} | {} | fee={:.9} SOL | cu_price_micro={} | t={}ms",
 		md.signature,
 		instr,
 		mint,
 		flow,
 		total_fee_sol,
+		unit_price_micro,
 		md.elapsed_ms
 	);
 }
