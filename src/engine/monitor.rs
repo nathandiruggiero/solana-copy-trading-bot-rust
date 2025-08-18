@@ -80,6 +80,8 @@ pub async fn copytrader(config: &Config) {
 		pnl_state.write().unwrap().start_balance_sol = Some(bal as f64 / 1_000_000_000.0);
 		info!("[PNL] start_balance_sol={:.9}", (bal as f64 / 1_000_000_000.0));
 	}
+	// Start lightweight periodic PnL summary logger (every 30s)
+	start_pnl_logger(config.rpc_https.clone(), our_wallet_pubkey, Arc::clone(&pnl_state));
 
 	// WS channel and consumer for low latency
 	let (tx_ws, mut rx_ws) = mpsc::unbounded_channel::<(String, u64)>();
@@ -534,11 +536,11 @@ fn extract_wsol_sol_delta(meta: &UiTransactionStatusMeta) -> (Option<f64>, Optio
 					let pre_amt = a.ui_token_amount.ui_amount.unwrap_or(0.0);
 					let post_amt = b.ui_token_amount.ui_amount.unwrap_or(0.0);
 					if post_amt > pre_amt {
-						// Wrapped SOL decreased from native but increased in WSOL, interpret as output SOL? Not reliable; we infer SOL flow from WSOL changes only when native SOL unchanged
-						return (None, Some((post_amt - pre_amt)));
+						// When native SOL unchanged, WSOL increase implies SOL output
+						return (None, Some(post_amt - pre_amt));
 					}
 					if pre_amt > post_amt {
-						return (Some((pre_amt - post_amt)), None);
+						return (Some(pre_amt - post_amt), None);
 					}
 				}
 			}
@@ -620,4 +622,23 @@ fn format_tokens(tokens: f64) -> String {
 	} else {
 		format!("{:.0}", tokens)
 	}
+}
+
+fn start_pnl_logger(rpc_url: String, wallet: Pubkey, pnl_state: Arc<RwLock<BotPnlState>>) {
+	tokio::spawn(async move {
+		let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+		loop {
+			let curr_sol = match rpc.get_balance(&wallet).await {
+				Ok(l) => l as f64 / 1_000_000_000.0,
+				Err(_) => { sleep(Duration::from_secs(30)).await; continue; }
+			};
+			let (start, realized) = {
+				let st = pnl_state.read().unwrap();
+				(st.start_balance_sol.unwrap_or(curr_sol), st.realized_pnl_sol)
+			};
+			let delta = curr_sol - start;
+			info!("[PNL-SUMMARY] wallet={} current={:.6} SOL delta_since_start={:.6} SOL realized={:.6} SOL", wallet, curr_sol, delta, realized);
+			sleep(Duration::from_secs(30)).await;
+		}
+	});
 } 
