@@ -22,8 +22,10 @@ use std::{
 use tokio::{sync::mpsc, task::spawn_blocking, time::sleep};
 
 use crate::common::config::Config;
+use crate::engine::swap::calculate_buy_lamports;
 
 const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+const PUMP_FUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
 #[derive(Debug, Clone)]
 pub struct TransactionMetadata {
@@ -40,6 +42,14 @@ pub struct TransactionMetadata {
 	pub slot: u64,
 	pub block_time: Option<i64>,
 	pub elapsed_ms: u128,
+}
+
+#[derive(Debug, Default)]
+struct BotPnlState {
+	// Cost basis per mint and realized PnL
+	invested_sol_by_mint: HashMap<String, f64>,
+	realized_pnl_sol: f64,
+	start_balance_sol: Option<f64>,
 }
 
 pub async fn copytrader(config: &Config) {
@@ -61,12 +71,22 @@ pub async fn copytrader(config: &Config) {
 
 	// Startup parameters resume
 	log_startup_summary(config, &our_wallet_pubkey);
+	log_mode(config.dry_run);
+
+	// PnL state and starting balance
+	let pnl_state: Arc<RwLock<BotPnlState>> = Arc::new(RwLock::new(BotPnlState::default()));
+	if let Ok(bal) = rpc_client.get_balance(&our_wallet_pubkey).await {
+		pnl_state.write().unwrap().start_balance_sol = Some(bal as f64 / 1_000_000_000.0);
+		info!("[PNL] start_balance_sol={:.9}", (bal as f64 / 1_000_000_000.0));
+	}
 
 	// WS channel and consumer for low latency
 	let (tx_ws, mut rx_ws) = mpsc::unbounded_channel::<(String, u64)>();
 	let recent_for_ws = Arc::clone(&recent_signatures);
 	let rpc_for_ws = RpcClient::new_with_commitment(config.rpc_https.clone(), CommitmentConfig::confirmed());
 	let config_ws = config.clone();
+	let pnl_state_ws = Arc::clone(&pnl_state);
+	let our_wallet_ws = our_wallet_pubkey;
 	tokio::spawn(async move {
 		let mut highest_ws_slot: u64 = rpc_for_ws.get_slot().await.unwrap_or(0);
 		while let Some((sig, slot)) = rx_ws.recv().await {
@@ -85,10 +105,31 @@ pub async fn copytrader(config: &Config) {
 						}
 						let should_copy = md.mint.is_some() && md.direction.is_some();
 						if should_copy {
-							if config_ws.dry_run {
-								info!("[DECISION] action=copy dry_run=true signature={} mint={:?} direction={:?}", md.signature, md.mint, md.direction);
-							} else {
-								info!("[DECISION] action=copy dry_run=false signature={} mint={:?} direction={:?}", md.signature, md.mint, md.direction);
+							let mint_key = md.mint.clone().unwrap_or_default();
+							match md.direction.as_deref() {
+								Some("Buy") => {
+									// Increase cost basis by our planned spend (percentage of wallet)
+									let planned_lamports = calculate_buy_lamports(&rpc_for_ws, &our_wallet_ws, &config_ws).await.unwrap_or(0);
+									let planned_sol = planned_lamports as f64 / 1_000_000_000.0;
+									let mut st = pnl_state_ws.write().unwrap();
+									*st.invested_sol_by_mint.entry(mint_key.clone()).or_insert(0.0) += planned_sol;
+									info!("[PNL] after_buy (planned) mint={} cost+={:.6} SOL", mint_key, planned_sol);
+									info!("[DECISION] action=copy dry_run={} signature={} mint={:?} direction=Buy", config_ws.dry_run, md.signature, md.mint);
+								}
+								Some("Sell") => {
+									// Realize PnL based on observed SOL out from the target trade (planned copy)
+									if let Some(out_sol) = md.output_sol {
+										let mut st = pnl_state_ws.write().unwrap();
+										let cost = st.invested_sol_by_mint.remove(&mint_key).unwrap_or(0.0);
+										let change = out_sol - cost;
+										st.realized_pnl_sol += change;
+										let start = st.start_balance_sol.unwrap_or(0.0);
+										let sim_balance = start + st.realized_pnl_sol;
+										info!("[PNL] after_sell (planned) mint={} proceeds={:.6} SOL cost={:.6} SOL realized_change={:.6} SOL total_realized={:.6} SOL sim_balance={:.6} SOL", mint_key, out_sol, cost, change, st.realized_pnl_sol, sim_balance);
+									}
+									info!("[DECISION] action=copy dry_run={} signature={} mint={:?} direction=Sell", config_ws.dry_run, md.signature, md.mint);
+								}
+								_ => {}
 							}
 						} else {
 							info!("[DECISION] action=pass reason=missing_required_fields signature={} mint={:?} direction={:?}", md.signature, md.mint, md.direction);
@@ -233,7 +274,7 @@ async fn poll_wallet_push(
 						let (planned_info, ata_info) = if let Some(dir) = md.direction.as_deref() {
 							match dir {
 								"Buy" => {
-									let planned_lamports = crate::engine::swap::calculate_buy_lamports(&rpc_client, our_wallet_pubkey, config).await.unwrap_or(0);
+									let planned_lamports = calculate_buy_lamports(&rpc_client, our_wallet_pubkey, config).await.unwrap_or(0);
 									let planned_sol = planned_lamports as f64 / 1_000_000_000.0;
 									// Estimate CU price from observed tx (avoid divide-by-zero)
 									let unit_price_micro = if md.compute_units_consumed > 0 { (md.priority_lamports.saturating_mul(1_000_000)) / md.compute_units_consumed } else { 0 };
@@ -340,8 +381,8 @@ async fn fetch_and_parse(
 		_ => Vec::new(),
 	};
 
-	// Must be Pump.fun program logs
-	let pump_present = logs.iter().any(|l| l.contains(PUMP_FUN_PROGRAM_ID));
+	// Must be Pump.fun program logs (market or AMM)
+	let pump_present = logs.iter().any(|l| l.contains(PUMP_FUN_PROGRAM_ID) || l.contains(PUMP_FUN_AMM_PROGRAM_ID));
 	if !pump_present { return Err(anyhow!("filtered: not pump.fun")); }
 
 	// Instruction type parsing
@@ -488,6 +529,16 @@ fn log_startup_summary(config: &Config, our_wallet: &Pubkey) {
 	info!("[STARTUP] our_wallet={}", our_wallet);
 	for w in &config.target_wallets {
 		info!("[STARTUP] target_wallet={}", w);
+	}
+
+	// Start balance is logged synchronously in copytrader
+}
+
+fn log_mode(dry_run: bool) {
+	if dry_run {
+		info!("[MODE] DRY-RUN enabled: transactions will NOT be sent");
+	} else {
+		info!("[MODE] LIVE: transactions WILL be sent");
 	}
 }
 

@@ -21,6 +21,7 @@ pub struct Config {
     pub slippage: f64,
     pub log_format: String,
     pub dry_run: bool,
+    pub metis_endpoint: String,
 }
 
 impl Config {
@@ -36,6 +37,7 @@ impl Config {
         let slippage_str = env::var("SLIPPAGE").unwrap_or_else(|_| "10".to_string());
         let log_format = env::var("LOG_FORMAT").unwrap_or_else(|_| "pretty".to_string());
         let dry_run = env::var("DRY_RUN").unwrap_or_else(|_| "true".to_string()).to_lowercase() == "true";
+        let metis_endpoint = env::var("METIS_ENDPOINT").unwrap_or_else(|_| "".to_string());
         
         let trade_percentage = trade_percentage_str.parse::<f64>().unwrap_or(1.0) / 100.0; // Convert percentage to decimal
         let slippage = slippage_str.parse::<f64>().unwrap_or(10.0) / 100.0; // Convert percentage to decimal
@@ -57,6 +59,7 @@ impl Config {
             slippage,
             log_format,
             dry_run,
+            metis_endpoint,
         }
     }
 }
