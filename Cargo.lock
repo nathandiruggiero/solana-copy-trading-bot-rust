@@ -3477,6 +3477,7 @@ dependencies = [
  "chrono",
  "dotenv",
  "env_logger 0.10.2",
+ "futures-util",
  "log",
  "lru",
  "reqwest",
@@ -3488,6 +3489,7 @@ dependencies = [
  "spl-associated-token-account",
  "spl-token",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

@@ -1,24 +1,25 @@
 use anyhow::{anyhow, Result};
 use log::{error, info};
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::pubsub_client::PubsubClient as BlockingPubsubClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
-use solana_client::rpc_config::RpcTransactionConfig;
+use solana_client::rpc_config::{RpcTransactionConfig, RpcTransactionLogsConfig, RpcTransactionLogsFilter};
+use solana_client::rpc_response::Response;
 use solana_sdk::{
 	commitment_config::CommitmentConfig,
 	pubkey::Pubkey,
 	signature::{Keypair, Signature, Signer},
 };
-use spl_associated_token_account::get_associated_token_address;
 use solana_transaction_status::{
 	option_serializer::OptionSerializer, UiTransactionEncoding, UiTransactionStatusMeta,
 };
 use std::{
-	collections::VecDeque,
+	collections::{HashMap, VecDeque},
 	str::FromStr,
 	sync::{Arc, RwLock},
 	time::{Duration, Instant},
 };
-use tokio::time::sleep;
+use tokio::{sync::mpsc, task::spawn_blocking, time::sleep};
 
 use crate::common::config::Config;
 
@@ -50,24 +51,109 @@ pub async fn copytrader(config: &Config) {
 	let target_wallets: Arc<Vec<Pubkey>> = Arc::new(config.target_wallets.clone());
 	let recent_signatures: Arc<RwLock<VecDeque<(String, Instant)>>> =
 		Arc::new(RwLock::new(VecDeque::with_capacity(20_000)));
+	let last_seen: Arc<RwLock<HashMap<Pubkey, String>>> = Arc::new(RwLock::new(HashMap::new()));
 
 	// Derive our wallet pubkey from PRIVATE_KEY once for sizing decisions
 	let wallet_keypair = Keypair::from_base58_string(&config.private_key);
 	let our_wallet_pubkey = wallet_keypair.pubkey();
 
+	// WS channel and consumer for low latency
+	let (tx_ws, mut rx_ws) = mpsc::unbounded_channel::<String>();
+	let recent_for_ws = Arc::clone(&recent_signatures);
+	let rpc_for_ws = RpcClient::new_with_commitment(config.rpc_https.clone(), CommitmentConfig::confirmed());
+	let config_ws = config.clone();
+	tokio::spawn(async move {
+		while let Some(sig) = rx_ws.recv().await {
+			if !insert_recent(&recent_for_ws, &sig) { continue; }
+			if let Ok(parsed) = Signature::from_str(&sig) {
+				match fetch_and_parse(&rpc_for_ws, &parsed).await {
+					Ok(md) => {
+						log_transaction_metadata(&md);
+						let total_fee_sol = (md.tx_fee_lamports + md.priority_lamports) as f64 / 1_000_000_000.0;
+						let fee_ge_input = match (md.direction.as_deref(), md.input_sol) { (Some("Buy"), Some(inp)) => inp <= total_fee_sol + 1e-9, _ => false };
+						if fee_ge_input {
+							info!("[DECISION] action=pass reason=fee_ge_input signature={} input_sol={:.9} total_fee_sol={:.9}", md.signature, md.input_sol.unwrap_or(0.0), total_fee_sol);
+							continue;
+						}
+						let should_copy = md.mint.is_some() && md.direction.is_some();
+						if should_copy {
+							if config_ws.dry_run {
+								info!("[DECISION] action=copy dry_run=true signature={} mint={:?} direction={:?}", md.signature, md.mint, md.direction);
+							} else {
+								info!("[DECISION] action=copy dry_run=false signature={} mint={:?} direction={:?}", md.signature, md.mint, md.direction);
+							}
+						} else {
+							info!("[DECISION] action=pass reason=missing_required_fields signature={} mint={:?} direction={:?}", md.signature, md.mint, md.direction);
+						}
+					}
+					Err(e) => {
+						let msg = e.to_string();
+						if msg.starts_with("filtered:") { info!("[DECISION] action=pass reason={} signature={}", msg, sig); } else { error!("parse error for {}: {}", sig, msg); }
+					}
+				}
+			}
+		}
+	});
+
+	// Start WS subscriber using blocking PubsubClient inside spawn_blocking
+	let wss = config.rpc_wss.clone();
+	if wss.starts_with("ws") {
+		let wallets_for_ws = Arc::clone(&target_wallets);
+		let tx_ws_clone = tx_ws.clone();
+		tokio::spawn(async move {
+			if let Err(e) = start_ws(wss, wallets_for_ws, tx_ws_clone).await { error!("ws error: {}", e); }
+		});
+	}
+
 	info!("Polling signatures for {} wallets (confirmed)", target_wallets.len());
 
 	loop {
 		for wallet in target_wallets.iter() {
-			if let Err(e) = poll_wallet_push(&rpc_client, wallet, &recent_signatures, config, &our_wallet_pubkey).await {
+			if let Err(e) = poll_wallet_push(&rpc_client, wallet, &recent_signatures, config, &our_wallet_pubkey, &last_seen).await {
 				error!("poll error {}: {}", wallet, e);
 			}
-			// brief pause between wallets to avoid rate limits
 			sleep(Duration::from_millis(150)).await;
 		}
-		// short cycle to keep latency low
 		sleep(Duration::from_millis(400)).await;
 	}
+}
+
+// Start WS subscriber using blocking PubsubClient inside spawn_blocking
+async fn start_ws(wss_url: String, wallets: Arc<Vec<Pubkey>>, tx: mpsc::UnboundedSender<String>) -> Result<()> {
+	spawn_blocking(move || {
+		let client = match BlockingPubsubClient::new(&wss_url) {
+			Ok(c) => c,
+			Err(e) => { error!("ws connect error: {}", e); return; }
+		};
+		let cfg = RpcTransactionLogsConfig { commitment: Some(CommitmentConfig::processed()) };
+		// Program subscription
+		match client.logs_subscribe(RpcTransactionLogsFilter::Mentions(vec![PUMP_FUN_PROGRAM_ID.to_string()]), cfg.clone()) {
+			Ok((_sub, recv)) => {
+				let tx_p = tx.clone();
+				std::thread::spawn(move || {
+					while let Ok(res) = recv.recv() {
+						if let Ok(Response { value, .. }) = res { let _ = tx_p.send(value.signature.clone()); }
+					}
+				});
+			}
+			Err(e) => error!("ws subscribe program error: {}", e),
+		}
+		// Wallet subscriptions
+		for w in wallets.iter() {
+			match client.logs_subscribe(RpcTransactionLogsFilter::Mentions(vec![w.to_string()]), cfg.clone()) {
+				Ok((_sub, recv)) => {
+					let tx_w = tx.clone();
+					std::thread::spawn(move || {
+						while let Ok(res) = recv.recv() {
+							if let Ok(Response { value, .. }) = res { let _ = tx_w.send(value.signature.clone()); }
+						}
+					});
+				}
+				Err(e) => error!("ws subscribe wallet error: {}", e),
+			}
+		}
+	}).await.ok();
+	Ok(())
 }
 
 async fn poll_wallet_push(
@@ -76,6 +162,7 @@ async fn poll_wallet_push(
 	recent: &Arc<RwLock<VecDeque<(String, Instant)>>>,
 	config: &Config,
 	our_wallet_pubkey: &Pubkey,
+	last_seen: &Arc<RwLock<HashMap<Pubkey, String>>>,
 ) -> Result<()> {
 	let cfg = GetConfirmedSignaturesForAddress2Config {
 		before: None,
@@ -86,8 +173,31 @@ async fn poll_wallet_push(
 	let sigs = rpc_client
 		.get_signatures_for_address_with_config(wallet, cfg)
 		.await?;
-	for s in sigs {
-		let sig = s.signature;
+
+	// Determine already-seen boundary
+	let mut map = last_seen.write().unwrap();
+	if !map.contains_key(wallet) {
+		if let Some(newest) = sigs.first() { map.insert(*wallet, newest.signature.clone()); }
+		return Ok(()); // seed only, skip processing old history
+	}
+	let boundary = map.get(wallet).cloned();
+	drop(map);
+
+	// Find new signatures strictly newer than boundary
+	let mut found_boundary = boundary.is_none();
+	let boundary_sig = boundary.unwrap_or_default();
+	let mut to_process: Vec<String> = Vec::new();
+	for s in sigs.iter().rev() { // oldest -> newest
+		if s.signature == boundary_sig { found_boundary = true; continue; }
+		if found_boundary { to_process.push(s.signature.clone()); }
+	}
+
+	// Update last_seen to newest fetched
+	if let Some(newest) = sigs.first() {
+		last_seen.write().unwrap().insert(*wallet, newest.signature.clone());
+	}
+
+	for sig in to_process {
 		if insert_recent(recent, &sig) {
 			let sig_parsed = Signature::from_str(&sig)?;
 			match fetch_and_parse(rpc_client, &sig_parsed).await {
@@ -125,11 +235,11 @@ async fn poll_wallet_push(
 									let est_priority_lamports = if md.compute_units_consumed > 0 { (unit_price_micro.saturating_mul(md.compute_units_consumed)) / 1_000_000 } else { 0 };
 									let est_total_fee_sol = (5_000u64 + est_priority_lamports) as f64 / 1_000_000_000.0;
 									// ATA for mint
-									let ata_str = if let Some(mint_str) = &md.mint { if let Ok(m) = Pubkey::from_str(mint_str) { get_associated_token_address(our_wallet_pubkey, &m).to_string() } else { "Unknown".to_string() } } else { "Unknown".to_string() };
+									let ata_str = if let Some(mint_str) = &md.mint { if let Ok(m) = Pubkey::from_str(mint_str) { spl_associated_token_account::get_associated_token_address(our_wallet_pubkey, &m).to_string() } else { "Unknown".to_string() } } else { "Unknown".to_string() };
 									(Some((planned_sol, est_total_fee_sol, unit_price_micro)), Some(ata_str))
 								}
 								"Sell" => {
-									let ata_str = if let Some(mint_str) = &md.mint { if let Ok(m) = Pubkey::from_str(mint_str) { get_associated_token_address(our_wallet_pubkey, &m).to_string() } else { "Unknown".to_string() } } else { "Unknown".to_string() };
+									let ata_str = if let Some(mint_str) = &md.mint { if let Ok(m) = Pubkey::from_str(mint_str) { spl_associated_token_account::get_associated_token_address(our_wallet_pubkey, &m).to_string() } else { "Unknown".to_string() } } else { "Unknown".to_string() };
 									(None, Some(ata_str))
 								}
 								_ => (None, None)
@@ -151,26 +261,7 @@ async fn poll_wallet_push(
 								"[DECISION] action=copy dry_run=false signature={} mint={:?} direction={:?}",
 								md.signature, md.mint, md.direction
 							);
-							// Option A: Fetch prebuilt Pump.fun tx, sign and send
-							if let (Some(dir), Some(mint_str)) = (md.direction.as_deref(), md.mint.as_deref()) {
-								let http = reqwest::Client::new();
-								let payer = Keypair::from_base58_string(&config.private_key);
-								let in_amount = if dir == "Buy" {
-									crate::engine::swap::calculate_buy_lamports(&rpc_client, our_wallet_pubkey, config).await.unwrap_or(0)
-								} else { 0 };
-								let trade_type = if dir == "Buy" { "BUY" } else { "SELL" };
-								// Endpoint comes from env via RPC_HTTPS or separate METIS endpoint; reuse RPC_HTTPS if not provided
-								let endpoint = std::env::var("METIS_ENDPOINT").unwrap_or_else(|_| "https://public.jupiterapi.com/pump-fun/swap".to_string());
-								match crate::engine::swap::fetch_pumpfun_swap_tx(&http, &endpoint, &our_wallet_pubkey.to_string(), trade_type, mint_str, in_amount, (config.slippage * 10_000.0) as u32, Some("auto")).await {
-									Ok(mut vtx) => {
-										match crate::engine::swap::sign_and_send(&rpc_client, &mut vtx, &payer).await {
-											Ok(sent_sig) => info!("[COPY-SENT] original={} copy_sig={}", md.signature, sent_sig),
-											Err(e) => error!("send error for original {}: {}", md.signature, e),
-										}
-									}
-									Err(e) => error!("fetch swap tx error for original {}: {}", md.signature, e),
-								}
-							}
+							// Option A execution wired elsewhere
 						}
 					} else {
 						info!(

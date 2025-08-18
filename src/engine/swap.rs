@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use base64::{engine::general_purpose, Engine as _};
 use bincode;
 use serde::{Deserialize, Serialize};
