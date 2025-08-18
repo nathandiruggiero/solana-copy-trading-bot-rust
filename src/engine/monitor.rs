@@ -118,21 +118,22 @@ pub async fn copytrader(config: &Config) {
 	}
 }
 
-// Start WS subscriber using blocking PubsubClient inside spawn_blocking
+// Start WS subscriber using static logs_subscribe API (no constructor)
 async fn start_ws(wss_url: String, wallets: Arc<Vec<Pubkey>>, tx: mpsc::UnboundedSender<String>) -> Result<()> {
 	spawn_blocking(move || {
-		let client = match BlockingPubsubClient::new(&wss_url) {
-			Ok(c) => c,
-			Err(e) => { error!("ws connect error: {}", e); return; }
-		};
 		let cfg = RpcTransactionLogsConfig { commitment: Some(CommitmentConfig::processed()) };
 		// Program subscription
-		match client.logs_subscribe(RpcTransactionLogsFilter::Mentions(vec![PUMP_FUN_PROGRAM_ID.to_string()]), cfg.clone()) {
+		match BlockingPubsubClient::logs_subscribe(
+			&wss_url,
+			RpcTransactionLogsFilter::Mentions(vec![PUMP_FUN_PROGRAM_ID.to_string()]),
+			cfg.clone(),
+		) {
 			Ok((_sub, recv)) => {
 				let tx_p = tx.clone();
 				std::thread::spawn(move || {
 					while let Ok(res) = recv.recv() {
-						if let Ok(Response { value, .. }) = res { let _ = tx_p.send(value.signature.clone()); }
+						let Response { value, .. } = res;
+						let _ = tx_p.send(value.signature.clone());
 					}
 				});
 			}
@@ -140,12 +141,17 @@ async fn start_ws(wss_url: String, wallets: Arc<Vec<Pubkey>>, tx: mpsc::Unbounde
 		}
 		// Wallet subscriptions
 		for w in wallets.iter() {
-			match client.logs_subscribe(RpcTransactionLogsFilter::Mentions(vec![w.to_string()]), cfg.clone()) {
+			match BlockingPubsubClient::logs_subscribe(
+				&wss_url,
+				RpcTransactionLogsFilter::Mentions(vec![w.to_string()]),
+				cfg.clone(),
+			) {
 				Ok((_sub, recv)) => {
 					let tx_w = tx.clone();
 					std::thread::spawn(move || {
 						while let Ok(res) = recv.recv() {
-							if let Ok(Response { value, .. }) = res { let _ = tx_w.send(value.signature.clone()); }
+							let Response { value, .. } = res;
+							let _ = tx_w.send(value.signature.clone());
 						}
 					});
 				}
