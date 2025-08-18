@@ -26,6 +26,7 @@ use crate::engine::swap::calculate_buy_lamports;
 
 const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMP_FUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 #[derive(Debug, Clone)]
 pub struct TransactionMetadata {
@@ -409,14 +410,23 @@ async fn fetch_and_parse(
 
 	let pre_sol = meta.pre_balances.first().copied().unwrap_or(0) as i128;
 	let post_sol = meta.post_balances.first().copied().unwrap_or(0) as i128;
-	let input_sol = if post_sol < pre_sol { Some((pre_sol - post_sol) as f64 / 1_000_000_000.0) } else { None };
-	let output_sol = if post_sol > pre_sol { Some((post_sol - pre_sol) as f64 / 1_000_000_000.0) } else { None };
+	let mut input_sol = if post_sol < pre_sol { Some((pre_sol - post_sol) as f64 / 1_000_000_000.0) } else { None };
+	let mut output_sol = if post_sol > pre_sol { Some((post_sol - pre_sol) as f64 / 1_000_000_000.0) } else { None };
+
+	// If native SOL unchanged, check WSOL movement
+	if input_sol.is_none() && output_sol.is_none() {
+		let (wsol_out, wsol_in) = extract_wsol_sol_delta(meta);
+		if let Some(v) = wsol_out { input_sol = Some(v); }
+		if let Some(v) = wsol_in { output_sol = Some(v); }
+	}
 
 	let (output_tokens, direction_token) = extract_token_delta(meta);
 
-	// Derive direction from instruction type primarily
+	// Derive direction
 	let mut direction = instruction_type.as_deref().map(|s| if s.starts_with("Buy") { "Buy".to_string() } else { "Sell".to_string() });
-	if direction.is_none() { direction = if let Some(dir) = direction_token { Some(dir) } else if post_sol < pre_sol { Some("Buy".to_string()) } else if post_sol > pre_sol { Some("Sell".to_string()) } else { None }; }
+	if direction.is_none() {
+		direction = if let Some(dir) = direction_token { Some(dir) } else if input_sol.unwrap_or(0.0) > 0.0 { Some("Buy".to_string()) } else if output_sol.unwrap_or(0.0) > 0.0 { Some("Sell".to_string()) } else { None };
+	}
 
 	let elapsed_ms = started.elapsed().as_millis();
 
@@ -453,9 +463,13 @@ fn extract_mint_from_balances(meta: &UiTransactionStatusMeta) -> Option<String> 
 			for (a, b) in pre_arr.iter().zip(post_arr.iter()) {
 				let a_amt = a.ui_token_amount.ui_amount.unwrap_or(0.0);
 				let b_amt = b.ui_token_amount.ui_amount.unwrap_or(0.0);
-				if b_amt > a_amt {
+				if b_amt > a_amt && b.mint != WSOL_MINT {
 					return Some(b.mint.clone());
 				}
+			}
+			// fallback: first non-WSOL mint
+			for b in post_arr.iter() {
+				if b.mint != WSOL_MINT { return Some(b.mint.clone()); }
 			}
 			post_arr.first().map(|x| x.mint.clone())
 		}
@@ -467,6 +481,7 @@ fn extract_token_delta(meta: &UiTransactionStatusMeta) -> (Option<f64>, Option<S
 	match (&meta.pre_token_balances, &meta.post_token_balances) {
 		(OptionSerializer::Some(pre_arr), OptionSerializer::Some(post_arr)) => {
 			for (a, b) in pre_arr.iter().zip(post_arr.iter()) {
+				if b.mint == WSOL_MINT { continue; }
 				let pre_amt = a.ui_token_amount.ui_amount.unwrap_or(0.0);
 				let post_amt = b.ui_token_amount.ui_amount.unwrap_or(0.0);
 				if post_amt > pre_amt {
@@ -474,6 +489,28 @@ fn extract_token_delta(meta: &UiTransactionStatusMeta) -> (Option<f64>, Option<S
 				}
 				if pre_amt > post_amt {
 					return (Some(pre_amt - post_amt), Some("Sell".to_string()));
+				}
+			}
+			(None, None)
+		}
+		_ => (None, None),
+	}
+}
+
+fn extract_wsol_sol_delta(meta: &UiTransactionStatusMeta) -> (Option<f64>, Option<f64>) {
+	match (&meta.pre_token_balances, &meta.post_token_balances) {
+		(OptionSerializer::Some(pre_arr), OptionSerializer::Some(post_arr)) => {
+			for (a, b) in pre_arr.iter().zip(post_arr.iter()) {
+				if b.mint == WSOL_MINT {
+					let pre_amt = a.ui_token_amount.ui_amount.unwrap_or(0.0);
+					let post_amt = b.ui_token_amount.ui_amount.unwrap_or(0.0);
+					if post_amt > pre_amt {
+						// Wrapped SOL decreased from native but increased in WSOL, interpret as output SOL? Not reliable; we infer SOL flow from WSOL changes only when native SOL unchanged
+						return (None, Some((post_amt - pre_amt)));
+					}
+					if pre_amt > post_amt {
+						return (Some((pre_amt - post_amt)), None);
+					}
 				}
 			}
 			(None, None)
