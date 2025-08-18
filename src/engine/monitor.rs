@@ -100,7 +100,7 @@ pub async fn copytrader(config: &Config) {
 			if let Ok(parsed) = Signature::from_str(&sig) {
 				match fetch_and_parse(&rpc_for_ws, &parsed).await {
 					Ok(md) => {
-						log_transaction_metadata(&md);
+						log_transaction_metadata_with_format(&md, &config_ws);
 						let total_fee_sol = (md.tx_fee_lamports + md.priority_lamports) as f64 / 1_000_000_000.0;
 						let fee_ge_input = match (md.direction.as_deref(), md.input_sol) { (Some("Buy"), Some(inp)) => inp <= total_fee_sol + 1e-9, _ => false };
 						if fee_ge_input {
@@ -272,7 +272,7 @@ async fn poll_wallet_push(
 			match fetch_and_parse(rpc_client, &sig_parsed).await {
 				Ok(md) => {
 					// Base classification log
-					log_transaction_metadata(&md);
+					log_transaction_metadata_with_format(&md, config);
 
 					// Fee-greater-or-equal-than-input guard (Buy: input SOL must be > total fees)
 					let total_fee_sol = (md.tx_fee_lamports + md.priority_lamports) as f64 / 1_000_000_000.0;
@@ -555,30 +555,48 @@ fn extract_wsol_sol_delta(meta: &UiTransactionStatusMeta) -> (Option<f64>, Optio
 	}
 }
 
-fn log_transaction_metadata(md: &TransactionMetadata) {
-	// Single-line summary as requested
+fn log_transaction_metadata_with_format(md: &TransactionMetadata, config: &Config) {
+	let json_mode = config.log_format.to_lowercase() == "json";
 	let instr = md.instruction_type.as_deref().unwrap_or("Unknown");
 	let mint = md.mint.as_deref().unwrap_or("Unknown");
 	let total_fee_sol = (md.tx_fee_lamports + md.priority_lamports) as f64 / 1_000_000_000.0;
-
-	let flow = match md.direction.as_deref() {
-		Some("Buy") => {
+	let unit_price_micro = if md.compute_units_consumed > 0 { (md.priority_lamports.saturating_mul(1_000_000)) / md.compute_units_consumed } else { 0 };
+	let direction = md.direction.as_deref().unwrap_or("");
+	if json_mode {
+		let obj = serde_json::json!({
+			"type": "bot",
+			"sig": md.signature,
+			"instruction": instr,
+			"mint": mint,
+			"direction": direction,
+			"input_sol": md.input_sol,
+			"output_sol": md.output_sol,
+			"output_tokens": md.output_tokens,
+			"fee_sol": total_fee_sol,
+			"cu_price_micro": unit_price_micro,
+			"elapsed_ms": md.elapsed_ms
+		});
+		info!("{}", obj);
+		return;
+	}
+	let emoji = match direction { "Buy" => "🟢", "Sell" => "🔴", _ => "" };
+	let flow = match direction {
+		"Buy" => {
 			let left = format_sol(md.input_sol.unwrap_or(0.0));
 			let right = format_tokens(md.output_tokens.unwrap_or(0.0));
 			format!("{} SOL → {} tokens", left, right)
 		}
-		Some("Sell") => {
+		"Sell" => {
 			let left = format_tokens(md.output_tokens.unwrap_or(0.0));
 			let right = format_sol(md.output_sol.unwrap_or(0.0));
 			format!("{} tokens → {} SOL", left, right)
 		}
 		_ => "N/A".to_string(),
 	};
-
-	let unit_price_micro = if md.compute_units_consumed > 0 { (md.priority_lamports.saturating_mul(1_000_000)) / md.compute_units_consumed } else { 0 };
 	info!(
-		"[BOT] sig={} | {} | mint={} | {} | fee={:.9} SOL | cu_price_micro={} | t={}ms",
+		"[BOT] sig={} | {} {} | mint={} | {} | fee={:.9} SOL | cu={} | t={}ms",
 		md.signature,
+		emoji,
 		instr,
 		mint,
 		flow,
@@ -617,17 +635,8 @@ fn log_mode(dry_run: bool) {
 	}
 }
 
-fn format_sol(sol: f64) -> String {
-	format!("{:.6}", sol)
-}
-
-fn format_tokens(tokens: f64) -> String {
-	if tokens >= 1000.0 {
-		format!("{:.0}k", tokens / 1000.0)
-	} else {
-		format!("{:.0}", tokens)
-	}
-}
+fn format_sol(sol: f64) -> String { format!("{:.6}", sol) }
+fn format_tokens(tokens: f64) -> String { if tokens >= 1000.0 { format!("{:.0}k", tokens / 1000.0) } else { format!("{:.0}", tokens) } }
 
 fn start_pnl_logger(rpc_url: String, wallet: Pubkey, pnl_state: Arc<RwLock<BotPnlState>>) {
 	tokio::spawn(async move {
