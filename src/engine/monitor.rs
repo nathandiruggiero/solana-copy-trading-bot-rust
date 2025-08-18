@@ -37,6 +37,8 @@ pub struct TransactionMetadata {
 	pub tx_fee_lamports: u64,
 	pub priority_lamports: u64,
 	pub compute_units_consumed: u64,
+	pub slot: u64,
+	pub block_time: Option<i64>,
 	pub elapsed_ms: u128,
 }
 
@@ -57,13 +59,19 @@ pub async fn copytrader(config: &Config) {
 	let wallet_keypair = Keypair::from_base58_string(&config.private_key);
 	let our_wallet_pubkey = wallet_keypair.pubkey();
 
+	// Startup parameters resume
+	log_startup_summary(config, &our_wallet_pubkey);
+
 	// WS channel and consumer for low latency
-	let (tx_ws, mut rx_ws) = mpsc::unbounded_channel::<String>();
+	let (tx_ws, mut rx_ws) = mpsc::unbounded_channel::<(String, u64)>();
 	let recent_for_ws = Arc::clone(&recent_signatures);
 	let rpc_for_ws = RpcClient::new_with_commitment(config.rpc_https.clone(), CommitmentConfig::confirmed());
 	let config_ws = config.clone();
 	tokio::spawn(async move {
-		while let Some(sig) = rx_ws.recv().await {
+		let mut highest_ws_slot: u64 = rpc_for_ws.get_slot().await.unwrap_or(0);
+		while let Some((sig, slot)) = rx_ws.recv().await {
+			if slot <= highest_ws_slot { continue; }
+			highest_ws_slot = slot;
 			if !insert_recent(&recent_for_ws, &sig) { continue; }
 			if let Ok(parsed) = Signature::from_str(&sig) {
 				match fetch_and_parse(&rpc_for_ws, &parsed).await {
@@ -98,6 +106,8 @@ pub async fn copytrader(config: &Config) {
 	// Start WS subscriber using blocking PubsubClient inside spawn_blocking
 	let wss = config.rpc_wss.clone();
 	if wss.starts_with("ws") {
+		info!("Initializing WebSocket logs_subscribe on {}", wss);
+		for w in target_wallets.iter() { info!("Subscribing to wallet logs via WS: {}", w); }
 		let wallets_for_ws = Arc::clone(&target_wallets);
 		let tx_ws_clone = tx_ws.clone();
 		tokio::spawn(async move {
@@ -119,45 +129,34 @@ pub async fn copytrader(config: &Config) {
 }
 
 // Start WS subscriber using static logs_subscribe API (no constructor)
-async fn start_ws(wss_url: String, wallets: Arc<Vec<Pubkey>>, tx: mpsc::UnboundedSender<String>) -> Result<()> {
+async fn start_ws(wss_url: String, wallets: Arc<Vec<Pubkey>>, tx: mpsc::UnboundedSender<(String, u64)>) -> Result<()> {
 	spawn_blocking(move || {
+		let mut _subs = Vec::new();
 		let cfg = RpcTransactionLogsConfig { commitment: Some(CommitmentConfig::processed()) };
-		// Program subscription
-		match BlockingPubsubClient::logs_subscribe(
-			&wss_url,
-			RpcTransactionLogsFilter::Mentions(vec![PUMP_FUN_PROGRAM_ID.to_string()]),
-			cfg.clone(),
-		) {
-			Ok((_sub, recv)) => {
-				let tx_p = tx.clone();
-				std::thread::spawn(move || {
-					while let Ok(res) = recv.recv() {
-						let Response { value, .. } = res;
-						let _ = tx_p.send(value.signature.clone());
-					}
-				});
-			}
-			Err(e) => error!("ws subscribe program error: {}", e),
-		}
-		// Wallet subscriptions
+		// Wallet subscriptions only (focus strictly on target wallets)
 		for w in wallets.iter() {
 			match BlockingPubsubClient::logs_subscribe(
 				&wss_url,
 				RpcTransactionLogsFilter::Mentions(vec![w.to_string()]),
 				cfg.clone(),
 			) {
-				Ok((_sub, recv)) => {
+				Ok((sub, recv)) => {
+					info!("WS subscribed: wallet {}", w);
+					_subs.push(sub);
 					let tx_w = tx.clone();
 					std::thread::spawn(move || {
 						while let Ok(res) = recv.recv() {
-							let Response { value, .. } = res;
-							let _ = tx_w.send(value.signature.clone());
+							let Response { context, value } = res;
+							let _ = tx_w.send((value.signature.clone(), context.slot));
 						}
 					});
 				}
 				Err(e) => error!("ws subscribe wallet error: {}", e),
 			}
 		}
+
+		// Keep subscriptions alive
+		loop { std::thread::sleep(Duration::from_secs(3600)); }
 	}).await.ok();
 	Ok(())
 }
@@ -391,6 +390,8 @@ async fn fetch_and_parse(
 		tx_fee_lamports,
 		priority_lamports,
 		compute_units_consumed,
+		slot: tx.slot,
+		block_time: tx.block_time,
 		elapsed_ms,
 	})
 }
@@ -469,6 +470,25 @@ fn log_transaction_metadata(md: &TransactionMetadata) {
 		total_fee_sol,
 		md.elapsed_ms
 	);
+}
+
+fn log_startup_summary(config: &Config, our_wallet: &Pubkey) {
+	let trade_pct = config.trade_percentage * 100.0;
+	let slippage_pct = config.slippage * 100.0;
+	info!(
+		"[STARTUP] rpc_https={} | rpc_wss={} | dry_run={} | log_format={} | trade_pct={:.2}% | slippage={:.2}% | targets={}",
+		config.rpc_https,
+		config.rpc_wss,
+		config.dry_run,
+		config.log_format,
+		trade_pct,
+		slippage_pct,
+		config.target_wallets.len()
+	);
+	info!("[STARTUP] our_wallet={}", our_wallet);
+	for w in &config.target_wallets {
+		info!("[STARTUP] target_wallet={}", w);
+	}
 }
 
 fn format_sol(sol: f64) -> String {
