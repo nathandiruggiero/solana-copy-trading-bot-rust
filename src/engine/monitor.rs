@@ -26,6 +26,7 @@ use crate::engine::swap::{calculate_buy_lamports, calculate_full_sell_amount};
 
 const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMP_FUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+const METEORA_DBC_PROGRAM_ID: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 #[derive(Debug, Clone)]
@@ -413,8 +414,12 @@ async fn fetch_and_parse(
 		_ => Vec::new(),
 	};
 
-	// Must be Pump.fun program logs (market or AMM)
-	let pump_present = logs.iter().any(|l| l.contains(PUMP_FUN_PROGRAM_ID) || l.contains(PUMP_FUN_AMM_PROGRAM_ID));
+	// Must be Pump.fun or supported AMM program logs
+	let pump_present = logs.iter().any(|l|
+		l.contains(PUMP_FUN_PROGRAM_ID) ||
+		l.contains(PUMP_FUN_AMM_PROGRAM_ID) ||
+		l.contains(METEORA_DBC_PROGRAM_ID)
+	);
 	if !pump_present { return Err(anyhow!("filtered: not pump.fun")); }
 
 	// Instruction type parsing
