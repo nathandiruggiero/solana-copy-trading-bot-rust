@@ -48,7 +48,8 @@ pub struct TransactionMetadata {
 
 #[derive(Debug, Default)]
 struct BotPnlState {
-	// Cost basis per mint and realized PnL
+	// Dry-run holdings (estimated token quantities) and cost basis per mint
+	holdings_tokens_by_mint: HashMap<String, f64>,
 	invested_sol_by_mint: HashMap<String, f64>,
 	realized_pnl_sol: f64,
 	start_balance_sol: Option<f64>,
@@ -118,19 +119,29 @@ pub async fn copytrader(config: &Config) {
 								Some("Buy") => {
 									let planned_lamports = calculate_buy_lamports(&rpc_for_ws, &our_wallet_ws, &config_ws).await.unwrap_or(0);
 									let planned_sol = planned_lamports as f64 / 1_000_000_000.0;
+									// Estimate tokens: use target trade rate tokens_per_sol if available from output_tokens/input_sol
+									let est_tokens = match (md.input_sol, md.output_tokens) {
+										(Some(in_sol), Some(out_tok)) if in_sol > 0.0 => {
+											let tokens_per_sol = out_tok / in_sol;
+											tokens_per_sol * planned_sol
+										}
+										_ => 0.0,
+									};
 									let mut st = pnl_state_ws.write().unwrap();
 									*st.invested_sol_by_mint.entry(mint_key.clone()).or_insert(0.0) += planned_sol;
+									*st.holdings_tokens_by_mint.entry(mint_key.clone()).or_insert(0.0) += est_tokens;
 									st.buy_count += 1;
 									st.total_buy_sol_planned += planned_sol;
 									let unit_price_micro = if md.compute_units_consumed > 0 { (md.priority_lamports.saturating_mul(1_000_000)) / md.compute_units_consumed } else { 0 };
 									let est_priority_lamports = if md.compute_units_consumed > 0 { (unit_price_micro.saturating_mul(md.compute_units_consumed)) / 1_000_000 } else { 0 };
 									let est_total_fee_sol = (md.tx_fee_lamports + est_priority_lamports) as f64 / 1_000_000_000.0;
 									info!(
-										"[DECISION] action=copy dry_run={} wallet={} dir=Buy mint={} planned={:.6} SOL fees_est={:.9} SOL cu_price_micro={} sig={}",
+										"[DECISION] action=copy dry_run={} wallet={} dir=Buy mint={} planned={:.6} SOL est_tokens={:.0} fees_est={:.9} SOL cu_price_micro={} sig={}",
 										config_ws.dry_run,
 										our_wallet_ws,
 										mint_key,
 										planned_sol,
+										est_tokens,
 										est_total_fee_sol,
 										unit_price_micro,
 										md.signature,
@@ -152,6 +163,20 @@ pub async fn copytrader(config: &Config) {
 									let unit_price_micro = if md.compute_units_consumed > 0 { (md.priority_lamports.saturating_mul(1_000_000)) / md.compute_units_consumed } else { 0 };
 									let est_priority_lamports = if md.compute_units_consumed > 0 { (unit_price_micro.saturating_mul(md.compute_units_consumed)) / 1_000_000 } else { 0 };
 									let est_total_fee_sol = (md.tx_fee_lamports + est_priority_lamports) as f64 / 1_000_000_000.0;
+									if let Some(out_sol) = md.output_sol {
+										let mut st = pnl_state_ws.write().unwrap();
+										let cost = st.invested_sol_by_mint.remove(&mint_key).unwrap_or(0.0);
+										let our_tokens = st.holdings_tokens_by_mint.remove(&mint_key).unwrap_or(0.0);
+										let est_price_per_token = match md.output_tokens { Some(tok) if tok > 0.0 => out_sol / tok, _ => 0.0 };
+										let est_proceeds = if est_price_per_token > 0.0 { our_tokens * est_price_per_token } else { out_sol };
+										let change = est_proceeds - cost;
+										st.realized_pnl_sol += change;
+										st.sell_count += 1;
+										st.total_sell_sol_observed += est_proceeds;
+										let start = st.start_balance_sol.unwrap_or(0.0);
+										let sim_balance = start + st.realized_pnl_sol;
+										info!("[PNL] after_sell (planned) mint={} est_proceeds={:.6} SOL cost={:.6} SOL realized_change={:.6} SOL total_realized={:.6} SOL sim_balance={:.6} SOL", mint_key, est_proceeds, cost, change, st.realized_pnl_sol, sim_balance);
+									}
 									info!(
 										"[DECISION] action=copy dry_run={} wallet={} dir=Sell mint={} token_raw={} cost_basis={:.6} SOL fees_est={:.9} SOL cu_price_micro={} sig={}",
 										config_ws.dry_run,
@@ -349,10 +374,16 @@ async fn poll_wallet_push(
 										let mint_key = md.mint.clone().unwrap_or_default();
 										let mut st = pnl_state.write().unwrap();
 										let cost = st.invested_sol_by_mint.remove(&mint_key).unwrap_or(0.0);
-										let change = out_sol - cost;
+										let our_tokens = st.holdings_tokens_by_mint.remove(&mint_key).unwrap_or(0.0);
+										let est_price_per_token = match md.output_tokens { Some(tok) if tok > 0.0 => out_sol / tok, _ => 0.0 };
+										let est_proceeds = if est_price_per_token > 0.0 { our_tokens * est_price_per_token } else { out_sol };
+										let change = est_proceeds - cost;
 										st.realized_pnl_sol += change;
 										st.sell_count += 1;
-										st.total_sell_sol_observed += out_sol;
+										st.total_sell_sol_observed += est_proceeds;
+										let start = st.start_balance_sol.unwrap_or(0.0);
+										let sim_balance = start + st.realized_pnl_sol;
+										info!("[PNL] after_sell (planned) mint={} est_proceeds={:.6} SOL cost={:.6} SOL realized_change={:.6} SOL total_realized={:.6} SOL sim_balance={:.6} SOL", mint_key, est_proceeds, cost, change, st.realized_pnl_sol, sim_balance);
 									}
 									(None, Some(ata_str))
 								}
