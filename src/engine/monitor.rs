@@ -137,6 +137,12 @@ pub async fn copytrader(config: &Config) {
 									);
 								}
 								Some("Sell") => {
+									// Only sell if we currently have a position in this mint (one-shot sell until next buy)
+									let has_position = { pnl_state_ws.read().unwrap().invested_sol_by_mint.contains_key(&mint_key) };
+									if !has_position {
+										info!("[DECISION] action=pass reason=no_position mint={} sig={}", mint_key, md.signature);
+										continue;
+									}
 									// Fetch our current token raw balance (sum of accounts)
 									let token_raw = if let Ok(mint_pk) = Pubkey::from_str(&mint_key) {
 										calculate_full_sell_amount(&rpc_for_ws, &our_wallet_ws, &mint_pk).await.unwrap_or(0)
@@ -331,10 +337,18 @@ async fn poll_wallet_push(
 								}
 								"Sell" => {
 									let ata_str = if let Some(mint_str) = &md.mint { if let Ok(m) = Pubkey::from_str(mint_str) { spl_associated_token_account::get_associated_token_address(our_wallet_pubkey, &m).to_string() } else { "Unknown".to_string() } } else { "Unknown".to_string() };
-									// Realize PnL counters (dry-run) using observed output SOL if present
+									// Skip if no position (one-shot sell policy)
+									{
+										let st = pnl_state.read().unwrap();
+										if !st.invested_sol_by_mint.contains_key(&md.mint.clone().unwrap_or_default()) {
+											info!("[DECISION] action=pass reason=no_position mint={:?} sig={}", md.mint, md.signature);
+										}
+									}
+									// Realize PnL on full sell
 									if let Some(out_sol) = md.output_sol {
+										let mint_key = md.mint.clone().unwrap_or_default();
 										let mut st = pnl_state.write().unwrap();
-										let cost = st.invested_sol_by_mint.remove(&md.mint.clone().unwrap_or_default()).unwrap_or(0.0);
+										let cost = st.invested_sol_by_mint.remove(&mint_key).unwrap_or(0.0);
 										let change = out_sol - cost;
 										st.realized_pnl_sol += change;
 										st.sell_count += 1;
