@@ -22,7 +22,12 @@ use std::{
 use tokio::{sync::mpsc, task::spawn_blocking, time::sleep};
 
 use crate::common::config::Config;
-use crate::engine::swap::{calculate_buy_lamports, calculate_full_sell_amount};
+use crate::engine::swap::{
+	calculate_buy_lamports,
+	calculate_full_sell_amount,
+	fetch_pumpfun_swap_tx,
+	sign_and_send,
+};
 
 const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMP_FUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
@@ -127,11 +132,14 @@ pub async fn copytrader(config: &Config) {
 										}
 										_ => 0.0,
 									};
-									let mut st = pnl_state_ws.write().unwrap();
-									*st.invested_sol_by_mint.entry(mint_key.clone()).or_insert(0.0) += planned_sol;
-									*st.holdings_tokens_by_mint.entry(mint_key.clone()).or_insert(0.0) += est_tokens;
-									st.buy_count += 1;
-									st.total_buy_sol_planned += planned_sol;
+									// Update dry-run PnL in a short write scope
+									{
+										let mut st = pnl_state_ws.write().unwrap();
+										*st.invested_sol_by_mint.entry(mint_key.clone()).or_insert(0.0) += planned_sol;
+										*st.holdings_tokens_by_mint.entry(mint_key.clone()).or_insert(0.0) += est_tokens;
+										st.buy_count += 1;
+										st.total_buy_sol_planned += planned_sol;
+									}
 									let unit_price_micro = if md.compute_units_consumed > 0 { (md.priority_lamports.saturating_mul(1_000_000)) / md.compute_units_consumed } else { 0 };
 									let est_priority_lamports = if md.compute_units_consumed > 0 { (unit_price_micro.saturating_mul(md.compute_units_consumed)) / 1_000_000 } else { 0 };
 									let est_total_fee_sol = (md.tx_fee_lamports + est_priority_lamports) as f64 / 1_000_000_000.0;
@@ -146,6 +154,19 @@ pub async fn copytrader(config: &Config) {
 										unit_price_micro,
 										md.signature,
 									);
+									if !config_ws.dry_run {
+										if let Some(mint_str) = md.mint.as_ref() {
+											if !config_ws.metis_endpoint.is_empty() {
+												let http = reqwest::Client::new();
+												if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config_ws.metis_endpoint, &our_wallet_ws.to_string(), "BUY", mint_str, planned_lamports, (config_ws.slippage * 10_000.0) as u32, Some("auto")).await {
+													match sign_and_send(&rpc_for_ws, &mut vtx, &wallet_keypair).await {
+														Ok(copy_sig) => info!("[COPY-SENT] original={} copy_sig={}", md.signature, copy_sig),
+														Err(e) => error!("send error: {}", e),
+													}
+												}
+											}
+										}
+									}
 								}
 								Some("Sell") => {
 									// Only sell if we currently have a position in this mint (one-shot sell until next buy)
@@ -158,24 +179,31 @@ pub async fn copytrader(config: &Config) {
 									let token_raw = if let Ok(mint_pk) = Pubkey::from_str(&mint_key) {
 										calculate_full_sell_amount(&rpc_for_ws, &our_wallet_ws, &mint_pk).await.unwrap_or(0)
 									} else { 0 };
-									let st = pnl_state_ws.read().unwrap();
-									let cost = st.invested_sol_by_mint.get(&mint_key).copied().unwrap_or(0.0);
+									// Read cost for logging in a short scope
+									let cost_for_log = {
+										let st = pnl_state_ws.read().unwrap();
+										st.invested_sol_by_mint.get(&mint_key).copied().unwrap_or(0.0)
+									};
 									let unit_price_micro = if md.compute_units_consumed > 0 { (md.priority_lamports.saturating_mul(1_000_000)) / md.compute_units_consumed } else { 0 };
 									let est_priority_lamports = if md.compute_units_consumed > 0 { (unit_price_micro.saturating_mul(md.compute_units_consumed)) / 1_000_000 } else { 0 };
 									let est_total_fee_sol = (md.tx_fee_lamports + est_priority_lamports) as f64 / 1_000_000_000.0;
 									if let Some(out_sol) = md.output_sol {
-										let mut st = pnl_state_ws.write().unwrap();
-										let cost = st.invested_sol_by_mint.remove(&mint_key).unwrap_or(0.0);
-										let our_tokens = st.holdings_tokens_by_mint.remove(&mint_key).unwrap_or(0.0);
-										let est_price_per_token = match md.output_tokens { Some(tok) if tok > 0.0 => out_sol / tok, _ => 0.0 };
-										let est_proceeds = if est_price_per_token > 0.0 { our_tokens * est_price_per_token } else { out_sol };
-										let change = est_proceeds - cost;
-										st.realized_pnl_sol += change;
-										st.sell_count += 1;
-										st.total_sell_sol_observed += est_proceeds;
-										let start = st.start_balance_sol.unwrap_or(0.0);
-										let sim_balance = start + st.realized_pnl_sol;
-										info!("[PNL] after_sell (planned) mint={} est_proceeds={:.6} SOL cost={:.6} SOL realized_change={:.6} SOL total_realized={:.6} SOL sim_balance={:.6} SOL", mint_key, est_proceeds, cost, change, st.realized_pnl_sol, sim_balance);
+										// Write lock only within this scope
+										let (est_proceeds, cost, realized_after, sim_balance_after) = {
+											let mut st = pnl_state_ws.write().unwrap();
+											let cost = st.invested_sol_by_mint.remove(&mint_key).unwrap_or(0.0);
+											let our_tokens = st.holdings_tokens_by_mint.remove(&mint_key).unwrap_or(0.0);
+											let est_price_per_token = match md.output_tokens { Some(tok) if tok > 0.0 => out_sol / tok, _ => 0.0 };
+											let est_proceeds = if est_price_per_token > 0.0 { our_tokens * est_price_per_token } else { out_sol };
+											let change = est_proceeds - cost;
+											st.realized_pnl_sol += change;
+											st.sell_count += 1;
+											st.total_sell_sol_observed += est_proceeds;
+											let start = st.start_balance_sol.unwrap_or(0.0);
+											let sim_balance = start + st.realized_pnl_sol;
+											(est_proceeds, cost, st.realized_pnl_sol, sim_balance)
+										};
+										info!("[PNL] after_sell (planned) mint={} est_proceeds={:.6} SOL cost={:.6} SOL total_realized={:.6} SOL sim_balance={:.6} SOL", mint_key, est_proceeds, cost, realized_after, sim_balance_after);
 									}
 									info!(
 										"[DECISION] action=copy dry_run={} wallet={} dir=Sell mint={} token_raw={} cost_basis={:.6} SOL fees_est={:.9} SOL cu_price_micro={} sig={}",
@@ -183,11 +211,28 @@ pub async fn copytrader(config: &Config) {
 										our_wallet_ws,
 										mint_key,
 										token_raw,
-										cost,
+										cost_for_log,
 										est_total_fee_sol,
 										unit_price_micro,
 										md.signature,
 									);
+									if !config_ws.dry_run {
+										if let Some(mint_str) = md.mint.as_ref() {
+											if !config_ws.metis_endpoint.is_empty() {
+												let http = reqwest::Client::new();
+												// Use token_raw if available, otherwise derive from holdings estimation and price (fallback best-effort)
+												let in_amount_raw = if token_raw > 0 { token_raw } else { 0 };
+												if in_amount_raw > 0 {
+													if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config_ws.metis_endpoint, &our_wallet_ws.to_string(), "SELL", mint_str, in_amount_raw, (config_ws.slippage * 10_000.0) as u32, Some("auto")).await {
+														match sign_and_send(&rpc_for_ws, &mut vtx, &wallet_keypair).await {
+															Ok(copy_sig) => info!("[COPY-SENT] original={} copy_sig={}", md.signature, copy_sig),
+															Err(e) => error!("send error: {}", e),
+														}
+													}
+												}
+											}
+										}
+									}
 								}
 								_ => {}
 							}
@@ -406,7 +451,30 @@ async fn poll_wallet_push(
 								"[DECISION] action=copy dry_run=false signature={} mint={:?} direction={:?}",
 								md.signature, md.mint, md.direction
 							);
-							// Option A execution wired elsewhere
+							if !config.metis_endpoint.is_empty() {
+								if let Some(dir) = md.direction.as_deref() {
+									if let Some(mint_str) = md.mint.as_deref() {
+										let http = reqwest::Client::new();
+										match dir {
+											"Buy" => {
+												let planned_lamports = calculate_buy_lamports(&rpc_client, our_wallet_pubkey, config).await.unwrap_or(0);
+												if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config.metis_endpoint, &our_wallet_pubkey.to_string(), "BUY", mint_str, planned_lamports, (config.slippage * 10_000.0) as u32, Some("auto")).await {
+													let _ = sign_and_send(&rpc_client, &mut vtx, &Keypair::from_base58_string(&config.private_key)).await;
+												}
+											}
+											"Sell" => {
+												let in_amount_raw = if let Ok(mint_pk) = Pubkey::from_str(mint_str) { calculate_full_sell_amount(&rpc_client, our_wallet_pubkey, &mint_pk).await.unwrap_or(0) } else { 0 };
+												if in_amount_raw > 0 {
+													if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config.metis_endpoint, &our_wallet_pubkey.to_string(), "SELL", mint_str, in_amount_raw, (config.slippage * 10_000.0) as u32, Some("auto")).await {
+														let _ = sign_and_send(&rpc_client, &mut vtx, &Keypair::from_base58_string(&config.private_key)).await;
+													}
+												}
+											}
+											_ => {}
+										}
+									}
+								}
+							}
 						}
 					} else {
 						info!(
@@ -454,24 +522,41 @@ async fn fetch_and_parse(
 	signature: &Signature,
 ) -> Result<TransactionMetadata> {
 	let started = Instant::now();
-	let cfg = RpcTransactionConfig {
-		encoding: Some(UiTransactionEncoding::JsonParsed),
-		max_supported_transaction_version: Some(0),
-		commitment: Some(CommitmentConfig::confirmed()),
-	};
-	let tx = match rpc_client
-		.get_transaction_with_config(signature, cfg)
-		.await
-	{
-		Ok(v) => v,
-		Err(e) => {
-			let msg = e.to_string();
-			if msg.contains("invalid type: null") {
-				return Err(anyhow!("filtered: tx_not_available"));
+
+	// Resilient fetching: try confirmed/jsonParsed → confirmed/json → finalized/jsonParsed → finalized/json, with brief retries
+	let attempt_matrix: &[(CommitmentConfig, UiTransactionEncoding)] = &[
+		(CommitmentConfig::confirmed(), UiTransactionEncoding::JsonParsed),
+		(CommitmentConfig::confirmed(), UiTransactionEncoding::Json),
+		(CommitmentConfig::finalized(), UiTransactionEncoding::JsonParsed),
+		(CommitmentConfig::finalized(), UiTransactionEncoding::Json),
+	];
+	let mut tx_opt = None;
+	for (commitment, encoding) in attempt_matrix.iter() {
+		let cfg = RpcTransactionConfig {
+			encoding: Some(*encoding),
+			max_supported_transaction_version: Some(0),
+			commitment: Some(commitment.clone()),
+		};
+		let mut attempt = 0;
+		while attempt < 2 {
+			match rpc_client.get_transaction_with_config(signature, cfg.clone()).await {
+				Ok(v) => { tx_opt = Some(v); break; }
+				Err(e) => {
+					let msg = e.to_string();
+					let is_null = msg.contains("invalid type: null") || msg.contains("not found") || msg.contains("Unavailable");
+					if is_null {
+						// Small backoff to give the indexer time to catch up
+						sleep(Duration::from_millis(200)).await;
+						attempt += 1;
+						continue;
+					}
+					return Err(anyhow!(msg));
+				}
 			}
-			return Err(anyhow!(msg));
 		}
-	};
+		if tx_opt.is_some() { break; }
+	}
+	let tx = match tx_opt { Some(v) => v, None => return Err(anyhow!("filtered: tx_not_available")) };
 
 	let meta: &UiTransactionStatusMeta = tx
 		.transaction
@@ -498,18 +583,11 @@ async fn fetch_and_parse(
 	);
 	if !pump_present { return Err(anyhow!("filtered: not pump.fun")); }
 
-	// Instruction type parsing
+	// Instruction type parsing (may be absent on some providers)
 	let instruction_type = logs
 		.iter()
 		.find_map(|l| l.strip_prefix("Program log: Instruction: "))
 		.map(|s| s.to_string());
-
-	// Only accept: Buy, Sell, BuyExactIn, SellExactIn
-	let is_allowed = instruction_type
-		.as_deref()
-		.map(|s| matches!(s, "Buy" | "Sell" | "BuyExactIn" | "SellExactIn"))
-		.unwrap_or(false);
-	if !is_allowed { return Err(anyhow!("filtered: not buy/sell exact")); }
 
 	// Priority fee
 	let cu_price_micro = extract_cu_price_micro_from_logs(&logs);
@@ -534,11 +612,19 @@ async fn fetch_and_parse(
 
 	let (output_tokens, direction_token) = extract_token_delta(meta);
 
-	// Derive direction
+	// Derive direction (fallback to deltas if no explicit instruction)
 	let mut direction = instruction_type.as_deref().map(|s| if s.starts_with("Buy") { "Buy".to_string() } else { "Sell".to_string() });
 	if direction.is_none() {
 		direction = if let Some(dir) = direction_token { Some(dir) } else if input_sol.unwrap_or(0.0) > 0.0 { Some("Buy".to_string()) } else if output_sol.unwrap_or(0.0) > 0.0 { Some("Sell".to_string()) } else { None };
 	}
+
+	// Only accept swaps that look like buy/sell, even if "Instruction: X" line is missing
+	let is_allowed = instruction_type
+		.as_deref()
+		.map(|s| matches!(s, "Buy" | "Sell" | "BuyExactIn" | "SellExactIn"))
+		.unwrap_or(false);
+	let accept = is_allowed || direction.is_some();
+	if !accept { return Err(anyhow!("filtered: not buy/sell exact")); }
 
 	let elapsed_ms = started.elapsed().as_millis();
 

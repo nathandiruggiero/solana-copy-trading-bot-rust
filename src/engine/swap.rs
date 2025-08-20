@@ -1,11 +1,13 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use bincode;
+use log::{error, info};
 use serde::{Deserialize, Serialize};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
+    message::VersionedMessage,
     pubkey::Pubkey,
     signature::{Keypair, Signature, Signer},
     transaction::VersionedTransaction,
@@ -87,15 +89,43 @@ pub async fn fetch_pumpfun_swap_tx(
         priority_fee_level: priority_fee_level,
         slippage_bps: Some(slippage_bps),
     };
+    info!(
+        "[COPY-REQ] endpoint={} type={} wallet={} mint={} in_amount_raw={} slippage_bps={} priority={}",
+        endpoint,
+        trade_type,
+        wallet,
+        mint,
+        in_amount_raw,
+        slippage_bps,
+        priority_fee_level.unwrap_or("none")
+    );
     let resp = http_client
         .post(endpoint)
         .json(&req)
         .send()
-        .await?
-        .error_for_status()?;
-    let body: PumpFunSwapResponse = resp.json().await?;
+        .await?;
+    let status = resp.status();
+    let bytes = resp.bytes().await?;
+    if !status.is_success() {
+        let body_text = String::from_utf8_lossy(&bytes);
+        error!(
+            "[COPY-ERR] endpoint={} status={} body={}",
+            endpoint,
+            status,
+            body_text
+        );
+        return Err(anyhow!(format!("swap endpoint error: {}", status)));
+    }
+    let body: PumpFunSwapResponse = serde_json::from_slice(&bytes)?;
     let data = general_purpose::STANDARD.decode(&body.transaction)?;
+    info!("[COPY-RX] tx_bytes={} b64_len={}", data.len(), body.transaction.len());
     let tx: VersionedTransaction = bincode::deserialize(&data)?;
+    // Brief introspection for debugging
+    let version = match &tx.message {
+        VersionedMessage::Legacy(_) => "legacy",
+        VersionedMessage::V0(_) => "v0",
+    };
+    info!("[COPY-TX] version={} sigs_present={}", version, tx.signatures.len());
     Ok(tx)
 }
 
@@ -105,8 +135,14 @@ pub async fn sign_and_send(
     tx: &mut VersionedTransaction,
     payer: &Keypair,
 ) -> Result<Signature> {
-    // Fill the first required signature with payer's signature over the message
+    // Log message size pre-sign
     let msg_bytes = tx.message.serialize();
+    info!(
+        "[COPY-SEND] msg_len={} sigs_before={}",
+        msg_bytes.len(),
+        tx.signatures.len()
+    );
+    // Fill the first required signature with payer's signature over the message
     let payer_sig = payer.sign_message(&msg_bytes);
     if tx.signatures.is_empty() {
         tx.signatures.push(payer_sig);
@@ -114,6 +150,7 @@ pub async fn sign_and_send(
         tx.signatures[0] = payer_sig;
     }
     let sig = rpc.send_transaction(tx).await?;
+    info!("[COPY-SUBMIT] signature={}", sig);
     // best-effort confirmation
     let _ = rpc
         .confirm_transaction_with_commitment(&sig, CommitmentConfig::confirmed())
