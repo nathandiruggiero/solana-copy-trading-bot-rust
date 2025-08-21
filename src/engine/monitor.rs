@@ -158,7 +158,7 @@ pub async fn copytrader(config: &Config) {
 										if let Some(mint_str) = md.mint.as_ref() {
 											if !config_ws.metis_endpoint.is_empty() {
 												let http = reqwest::Client::new();
-												if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config_ws.metis_endpoint, &our_wallet_ws.to_string(), "BUY", mint_str, planned_lamports, (config_ws.slippage * 10_000.0) as u32, Some("auto")).await {
+												if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config_ws.metis_endpoint, &our_wallet_ws.to_string(), "BUY", mint_str, planned_lamports, (config_ws.slippage * 10_000.0) as u32, Some(&config_ws.priority_fee_level)).await {
 													match sign_and_send(&rpc_for_ws, &mut vtx, &wallet_keypair).await {
 														Ok(copy_sig) => info!("[COPY-SENT] original={} copy_sig={}", md.signature, copy_sig),
 														Err(e) => error!("send error: {}", e),
@@ -223,7 +223,7 @@ pub async fn copytrader(config: &Config) {
 												// Use token_raw if available, otherwise derive from holdings estimation and price (fallback best-effort)
 												let in_amount_raw = if token_raw > 0 { token_raw } else { 0 };
 												if in_amount_raw > 0 {
-													if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config_ws.metis_endpoint, &our_wallet_ws.to_string(), "SELL", mint_str, in_amount_raw, (config_ws.slippage * 10_000.0) as u32, Some("auto")).await {
+													if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config_ws.metis_endpoint, &our_wallet_ws.to_string(), "SELL", mint_str, in_amount_raw, (config_ws.slippage * 10_000.0) as u32, Some(&config_ws.priority_fee_level)).await {
 														match sign_and_send(&rpc_for_ws, &mut vtx, &wallet_keypair).await {
 															Ok(copy_sig) => info!("[COPY-SENT] original={} copy_sig={}", md.signature, copy_sig),
 															Err(e) => error!("send error: {}", e),
@@ -458,14 +458,14 @@ async fn poll_wallet_push(
 										match dir {
 											"Buy" => {
 												let planned_lamports = calculate_buy_lamports(&rpc_client, our_wallet_pubkey, config).await.unwrap_or(0);
-												if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config.metis_endpoint, &our_wallet_pubkey.to_string(), "BUY", mint_str, planned_lamports, (config.slippage * 10_000.0) as u32, Some("auto")).await {
+												if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config.metis_endpoint, &our_wallet_pubkey.to_string(), "BUY", mint_str, planned_lamports, (config.slippage * 10_000.0) as u32, Some(&config.priority_fee_level)).await {
 													let _ = sign_and_send(&rpc_client, &mut vtx, &Keypair::from_base58_string(&config.private_key)).await;
 												}
 											}
 											"Sell" => {
 												let in_amount_raw = if let Ok(mint_pk) = Pubkey::from_str(mint_str) { calculate_full_sell_amount(&rpc_client, our_wallet_pubkey, &mint_pk).await.unwrap_or(0) } else { 0 };
 												if in_amount_raw > 0 {
-													if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config.metis_endpoint, &our_wallet_pubkey.to_string(), "SELL", mint_str, in_amount_raw, (config.slippage * 10_000.0) as u32, Some("auto")).await {
+													if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config.metis_endpoint, &our_wallet_pubkey.to_string(), "SELL", mint_str, in_amount_raw, (config.slippage * 10_000.0) as u32, Some(&config.priority_fee_level)).await {
 														let _ = sign_and_send(&rpc_client, &mut vtx, &Keypair::from_base58_string(&config.private_key)).await;
 													}
 												}
