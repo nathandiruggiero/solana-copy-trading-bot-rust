@@ -15,6 +15,8 @@ use solana_sdk::{
 use std::str::FromStr;
 
 use crate::common::config::Config;
+use serde_json::Value;
+use reqwest::StatusCode;
 
 /// Calculate lamports to spend for a buy based on wallet balance and trade percentage
 pub async fn calculate_buy_lamports(
@@ -126,6 +128,67 @@ pub async fn fetch_pumpfun_swap_tx(
         VersionedMessage::V0(_) => "v0",
     };
     info!("[COPY-TX] version={} sigs_present={}", version, tx.signatures.len());
+    Ok(tx)
+}
+
+/// Request a Jupiter swap tx (supports Raydium/other routes). Handles WSOL wrapping via API.
+pub async fn fetch_jupiter_swap_tx(
+    http_client: &reqwest::Client,
+    config: &Config,
+    wallet: &str,
+    input_mint: &str,
+    output_mint: &str,
+    in_amount_raw: u64,
+    slippage_bps: u32,
+) -> Result<VersionedTransaction> {
+    // 1) Quote
+    let url = format!(
+        "{}?inputMint={}&outputMint={}&amount={}&slippageBps={}&onlyDirectRoutes=false&asLegacyTransaction=false",
+        config.jupiter_quote_url,
+        input_mint,
+        output_mint,
+        in_amount_raw,
+        slippage_bps
+    );
+    info!(
+        "[JUP-QUOTE] {} input={} output={} amount={} bps={}",
+        config.jupiter_quote_url, input_mint, output_mint, in_amount_raw, slippage_bps
+    );
+    let quote_resp = http_client.get(&url).send().await?.error_for_status()?;
+    let quote_json: Value = quote_resp.json().await?;
+    let first_route = quote_json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|arr| arr.first())
+        .cloned()
+        .ok_or_else(|| anyhow!("no jupiter route"))?;
+
+    // 2) Swap
+    let mut swap_body = serde_json::Map::new();
+    swap_body.insert("quoteResponse".to_string(), first_route);
+    swap_body.insert("userPublicKey".to_string(), Value::String(wallet.to_string()));
+    swap_body.insert("wrapAndUnwrapSol".to_string(), Value::Bool(true));
+    swap_body.insert("asLegacyTransaction".to_string(), Value::Bool(false));
+    swap_body.insert("useSharedAccounts".to_string(), Value::Bool(true));
+    // Optional: carry slippage explicitly
+    swap_body.insert("slippageBps".to_string(), Value::Number(slippage_bps.into()));
+
+    info!(
+        "[JUP-SWAP] {} wallet={} input={} output={} amount={}",
+        config.jupiter_swap_url, wallet, input_mint, output_mint, in_amount_raw
+    );
+    let swap_resp = http_client
+        .post(&config.jupiter_swap_url)
+        .json(&Value::Object(swap_body))
+        .send()
+        .await?
+        .error_for_status()?;
+    #[derive(Deserialize)]
+    struct JupiterSwapResponse { #[serde(rename = "swapTransaction")] swap_tx: String }
+    let body: JupiterSwapResponse = swap_resp.json().await?;
+    let data = general_purpose::STANDARD.decode(&body.swap_tx)?;
+    info!("[JUP-RX] tx_bytes={} b64_len={}", data.len(), body.swap_tx.len());
+    let tx: VersionedTransaction = bincode::deserialize(&data)?;
     Ok(tx)
 }
 

@@ -26,6 +26,7 @@ use crate::engine::swap::{
 	calculate_buy_lamports,
 	calculate_full_sell_amount,
 	fetch_pumpfun_swap_tx,
+	fetch_jupiter_swap_tx,
 	sign_and_send,
 };
 
@@ -163,6 +164,14 @@ pub async fn copytrader(config: &Config) {
 														Ok(copy_sig) => info!("[COPY-SENT] original={} copy_sig={}", md.signature, copy_sig),
 														Err(e) => error!("send error: {}", e),
 													}
+												} else if config_ws.enable_raydium {
+													// Jupiter: SOL -> token
+													if let Ok(mut vtx) = fetch_jupiter_swap_tx(&http, &config_ws, &our_wallet_ws.to_string(), "So11111111111111111111111111111111111111112", mint_str, planned_lamports, (config_ws.slippage * 10_000.0) as u32).await {
+														match sign_and_send(&rpc_for_ws, &mut vtx, &wallet_keypair).await {
+															Ok(copy_sig) => info!("[COPY-SENT] original={} copy_sig={}", md.signature, copy_sig),
+															Err(e) => error!("send error: {}", e),
+														}
+													}
 												}
 											}
 										}
@@ -224,9 +233,11 @@ pub async fn copytrader(config: &Config) {
 												let in_amount_raw = if token_raw > 0 { token_raw } else { 0 };
 												if in_amount_raw > 0 {
 													if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config_ws.metis_endpoint, &our_wallet_ws.to_string(), "SELL", mint_str, in_amount_raw, (config_ws.slippage * 10_000.0) as u32, Some(&config_ws.priority_fee_level)).await {
-														match sign_and_send(&rpc_for_ws, &mut vtx, &wallet_keypair).await {
-															Ok(copy_sig) => info!("[COPY-SENT] original={} copy_sig={}", md.signature, copy_sig),
-															Err(e) => error!("send error: {}", e),
+														let _ = sign_and_send(&rpc_for_ws, &mut vtx, &wallet_keypair).await;
+													} else if config_ws.enable_raydium {
+														// Jupiter: token -> SOL
+														if let Ok(mut vtx) = fetch_jupiter_swap_tx(&http, &config_ws, &our_wallet_ws.to_string(), mint_str, "So11111111111111111111111111111111111111112", in_amount_raw, (config_ws.slippage * 10_000.0) as u32).await {
+															let _ = sign_and_send(&rpc_for_ws, &mut vtx, &wallet_keypair).await;
 														}
 													}
 												}
@@ -460,6 +471,11 @@ async fn poll_wallet_push(
 												let planned_lamports = calculate_buy_lamports(&rpc_client, our_wallet_pubkey, config).await.unwrap_or(0);
 												if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config.metis_endpoint, &our_wallet_pubkey.to_string(), "BUY", mint_str, planned_lamports, (config.slippage * 10_000.0) as u32, Some(&config.priority_fee_level)).await {
 													let _ = sign_and_send(&rpc_client, &mut vtx, &Keypair::from_base58_string(&config.private_key)).await;
+												} else if config.enable_raydium {
+													// Jupiter: SOL -> token
+													if let Ok(mut vtx) = fetch_jupiter_swap_tx(&http, config, &our_wallet_pubkey.to_string(), "So11111111111111111111111111111111111111112", mint_str, planned_lamports, (config.slippage * 10_000.0) as u32).await {
+														let _ = sign_and_send(&rpc_client, &mut vtx, &Keypair::from_base58_string(&config.private_key)).await;
+													}
 												}
 											}
 											"Sell" => {
@@ -467,6 +483,11 @@ async fn poll_wallet_push(
 												if in_amount_raw > 0 {
 													if let Ok(mut vtx) = fetch_pumpfun_swap_tx(&http, &config.metis_endpoint, &our_wallet_pubkey.to_string(), "SELL", mint_str, in_amount_raw, (config.slippage * 10_000.0) as u32, Some(&config.priority_fee_level)).await {
 														let _ = sign_and_send(&rpc_client, &mut vtx, &Keypair::from_base58_string(&config.private_key)).await;
+													} else if config.enable_raydium {
+														// Jupiter: token -> SOL
+														if let Ok(mut vtx) = fetch_jupiter_swap_tx(&http, config, &our_wallet_pubkey.to_string(), mint_str, "So11111111111111111111111111111111111111112", in_amount_raw, (config.slippage * 10_000.0) as u32).await {
+															let _ = sign_and_send(&rpc_client, &mut vtx, &Keypair::from_base58_string(&config.private_key)).await;
+														}
 													}
 												}
 											}
@@ -576,12 +597,12 @@ async fn fetch_and_parse(
 	};
 
 	// Must be Pump.fun or supported AMM program logs
-	let pump_present = logs.iter().any(|l|
-		l.contains(PUMP_FUN_PROGRAM_ID) ||
-		l.contains(PUMP_FUN_AMM_PROGRAM_ID) ||
-		l.contains(METEORA_DBC_PROGRAM_ID)
-	);
-	if !pump_present { return Err(anyhow!("filtered: not pump.fun")); }
+	// let pump_present = logs.iter().any(|l|
+	// 	l.contains(PUMP_FUN_PROGRAM_ID) ||
+	// 	l.contains(PUMP_FUN_AMM_PROGRAM_ID) ||
+	// 	l.contains(METEORA_DBC_PROGRAM_ID)
+	// );
+	// if !pump_present { return Err(anyhow!("filtered: not pump.fun")); }
 
 	// Instruction type parsing (may be absent on some providers)
 	let instruction_type = logs

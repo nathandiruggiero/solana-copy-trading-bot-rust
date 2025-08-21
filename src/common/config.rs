@@ -23,6 +23,9 @@ pub struct Config {
     pub dry_run: bool,
     pub metis_endpoint: String,
     pub priority_fee_level: String,
+    pub enable_raydium: bool,
+    pub jupiter_quote_url: String,
+    pub jupiter_swap_url: String,
 }
 
 impl Config {
@@ -40,6 +43,9 @@ impl Config {
         let dry_run = env::var("DRY_RUN").unwrap_or_else(|_| "true".to_string()).to_lowercase() == "true";
         let metis_endpoint = env::var("METIS_ENDPOINT").unwrap_or_else(|_| "".to_string());
         let priority_fee_level = env::var("PRIORITY_FEE_LEVEL").unwrap_or_else(|_| "low".to_string());
+        let enable_raydium = env::var("ENABLE_RAYDIUM").unwrap_or_else(|_| "false".to_string()).to_lowercase() == "true";
+        let jupiter_quote_url = env::var("JUPITER_QUOTE_URL").unwrap_or_else(|_| "https://quote-api.jup.ag/v6/quote".to_string());
+        let jupiter_swap_url = env::var("JUPITER_SWAP_URL").unwrap_or_else(|_| "https://quote-api.jup.ag/v6/swap".to_string());
         
         let trade_percentage = trade_percentage_str.parse::<f64>().unwrap_or(1.0) / 100.0; // Convert percentage to decimal
         let slippage = slippage_str.parse::<f64>().unwrap_or(10.0) / 100.0; // Convert percentage to decimal
@@ -63,6 +69,9 @@ impl Config {
             dry_run,
             metis_endpoint,
             priority_fee_level,
+            enable_raydium,
+            jupiter_quote_url,
+            jupiter_swap_url,
         }
     }
 }
