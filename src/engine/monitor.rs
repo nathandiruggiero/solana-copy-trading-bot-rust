@@ -825,4 +825,36 @@ fn start_pnl_logger(rpc_url: String, wallet: Pubkey, pnl_state: Arc<RwLock<BotPn
 			sleep(Duration::from_secs(30)).await;
 		}
 	});
+}
+
+fn apply_our_trade_to_pnl(pnl_state: &Arc<RwLock<BotPnlState>>, md: &TransactionMetadata) {
+	let mint_key = md.mint.clone().unwrap_or_else(|| "Unknown".to_string());
+	match md.direction.as_deref() {
+		Some("Buy") => {
+			let spent_sol = md.input_sol.unwrap_or(0.0);
+			let received_tokens = md.output_tokens.unwrap_or(0.0);
+			let mut st = pnl_state.write().unwrap();
+			*st.invested_sol_by_mint.entry(mint_key.clone()).or_insert(0.0) += spent_sol;
+			*st.holdings_tokens_by_mint.entry(mint_key.clone()).or_insert(0.0) += received_tokens;
+			st.buy_count += 1;
+			st.total_buy_sol_planned += spent_sol;
+			info!("[PNL] after_buy (executed) mint={} spent={:.6} SOL received_tokens={:.0}", mint_key, spent_sol, received_tokens);
+		}
+		Some("Sell") => {
+			let proceeds_sol = md.output_sol.unwrap_or(0.0);
+			let (cost, change, total_realized, sim_balance) = {
+				let mut st = pnl_state.write().unwrap();
+				let cost = st.invested_sol_by_mint.remove(&mint_key).unwrap_or(0.0);
+				let _ = st.holdings_tokens_by_mint.remove(&mint_key).unwrap_or(0.0);
+				let change = proceeds_sol - cost;
+				st.realized_pnl_sol += change;
+				st.sell_count += 1;
+				st.total_sell_sol_observed += proceeds_sol;
+				let start = st.start_balance_sol.unwrap_or(0.0);
+				(cost, change, st.realized_pnl_sol, start + st.realized_pnl_sol)
+			};
+			info!("[PNL] after_sell (executed) mint={} proceeds={:.6} SOL cost={:.6} SOL realized_change={:.6} SOL total_realized={:.6} SOL sim_balance={:.6} SOL", mint_key, proceeds_sol, cost, change, total_realized, sim_balance);
+		}
+		_ => {}
+	}
 } 
