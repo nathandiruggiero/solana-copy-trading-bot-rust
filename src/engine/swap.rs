@@ -146,12 +146,13 @@ pub async fn fetch_jupiter_swap_tx(
 ) -> Result<VersionedTransaction> {
     // 1) Quote
     let url = format!(
-        "{}?inputMint={}&outputMint={}&amount={}&slippageBps={}&onlyDirectRoutes=true&asLegacyTransaction=false",
+        "{}?inputMint={}&outputMint={}&amount={}&slippageBps={}&onlyDirectRoutes={}&asLegacyTransaction=false",
         config.jupiter_quote_url,
         input_mint,
         output_mint,
         in_amount_raw,
-        slippage_bps
+        slippage_bps,
+        if config.jupiter_only_direct { "true" } else { "false" }
     );
     info!(
         "[JUP-QUOTE] {} input={} output={} amount={} bps={}",
@@ -178,14 +179,30 @@ pub async fn fetch_jupiter_swap_tx(
             return Err(anyhow!(e));
         }
     };
-    let first_route = quote_json
-        .get("data")
-        .and_then(|d| d.as_array())
-        .and_then(|arr| arr.first())
-        .cloned()
-        .ok_or_else(|| anyhow!("no jupiter route"))?;
-    let routes_len = quote_json.get("data").and_then(|d| d.as_array()).map(|a| a.len()).unwrap_or(0);
-    info!("[JUP-ROUTES] count={}", routes_len);
+    let routes = quote_json.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    let mut first_route = routes.first().cloned();
+    let mut routes_len = routes.len();
+    info!("[JUP-ROUTES] direct_only={} count={}", config.jupiter_only_direct, routes_len);
+    if first_route.is_none() && config.jupiter_only_direct {
+        // Fallback: allow indirect routes
+        let url2 = format!(
+            "{}?inputMint={}&outputMint={}&amount={}&slippageBps={}&onlyDirectRoutes=false&asLegacyTransaction=false",
+            config.jupiter_quote_url, input_mint, output_mint, in_amount_raw, slippage_bps
+        );
+        info!("[JUP-QUOTE2] {} input={} output={} amount={} bps={}", config.jupiter_quote_url, input_mint, output_mint, in_amount_raw, slippage_bps);
+        let q2 = http_client.get(&url2).send().await;
+        if let Ok(r2) = q2 {
+            if r2.status().is_success() {
+                if let Ok(j2) = r2.json::<Value>().await {
+                    let routes2 = j2.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+                    routes_len = routes2.len();
+                    info!("[JUP-ROUTES2] count={}", routes_len);
+                    first_route = routes2.first().cloned();
+                }
+            }
+        }
+    }
+    let first_route = match first_route { Some(v) => v, None => { info!("[JUP-NO-ROUTE] input={} output={} amount={}", input_mint, output_mint, in_amount_raw); return Err(anyhow!("no jupiter route")); } };
 
     // 2) Swap
     let mut swap_body = serde_json::Map::new();
@@ -268,11 +285,41 @@ pub async fn sign_and_send(
         preflight_commitment: Some(CommitmentLevel::Processed),
         ..RpcSendTransactionConfig::default()
     };
-    let sig = rpc.send_transaction_with_config(tx, cfg).await?;
-    info!("[COPY-SUBMIT] signature={}", sig);
-    // best-effort confirmation
-    let _ = rpc
-        .confirm_transaction_with_commitment(&sig, CommitmentConfig::confirmed())
-        .await;
-    Ok(sig)
+    // Optional pre-send balance log for debugging
+    match rpc.get_balance(&payer.pubkey()).await {
+        Ok(lamports) => info!("[COPY-PAYER] balance_pre={:.9} SOL", lamports as f64 / 1_000_000_000.0),
+        Err(e) => error!("[COPY-PAYER-ERR] get_balance: {}", e),
+    }
+
+    match rpc.send_transaction_with_config(tx, cfg).await {
+        Ok(sig) => {
+            info!("[COPY-SUBMIT] signature={}", sig);
+            // best-effort confirmation
+            let _ = rpc
+                .confirm_transaction_with_commitment(&sig, CommitmentConfig::confirmed())
+                .await;
+            Ok(sig)
+        }
+        Err(e) => {
+            error!("[COPY-SEND-ERR] {}", e);
+            // Try to simulate to extract logs and exact failure
+            match rpc.simulate_transaction(tx).await {
+                Ok(sim) => {
+                    if let Some(err) = sim.value.err {
+                        error!("[COPY-SIM-ERR] {:?}", err);
+                    }
+                    if let Some(logs) = sim.value.logs {
+                        for l in logs {
+                            info!("[COPY-SIM-LOG] {}", l);
+                        }
+                    }
+                    if let Some(units) = sim.value.units_consumed {
+                        info!("[COPY-SIM] units_consumed={}", units);
+                    }
+                }
+                Err(se) => error!("[COPY-SIM-RPC-ERR] {}", se),
+            }
+            Err(anyhow!(e))
+        }
+    }
 } 

@@ -26,6 +26,7 @@ pub struct Config {
     pub enable_raydium: bool,
     pub jupiter_quote_url: String,
     pub jupiter_swap_url: String,
+    pub jupiter_only_direct: bool,
     pub min_buy_sol: f64,
     pub skip_preflight: bool,
 }
@@ -48,6 +49,7 @@ impl Config {
         let enable_raydium = env::var("ENABLE_RAYDIUM").unwrap_or_else(|_| "false".to_string()).to_lowercase() == "true";
         let jupiter_quote_url = env::var("JUPITER_QUOTE_URL").unwrap_or_else(|_| "https://quote-api.jup.ag/v6/quote".to_string());
         let jupiter_swap_url = env::var("JUPITER_SWAP_URL").unwrap_or_else(|_| "https://quote-api.jup.ag/v6/swap".to_string());
+        let jupiter_only_direct = env::var("JUPITER_ONLY_DIRECT").unwrap_or_else(|_| "true".to_string()).to_lowercase() == "true";
         let min_buy_sol = env::var("MIN_BUY_SOL").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.02);
         let skip_preflight = env::var("SKIP_PREFLIGHT").unwrap_or_else(|_| "false".to_string()).to_lowercase() == "true";
         
@@ -76,6 +78,7 @@ impl Config {
             enable_raydium,
             jupiter_quote_url,
             jupiter_swap_url,
+            jupiter_only_direct,
             min_buy_sol,
             skip_preflight,
         }

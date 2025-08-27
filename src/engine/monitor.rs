@@ -47,6 +47,7 @@ pub struct TransactionMetadata {
 	pub tx_fee_lamports: u64,
 	pub priority_lamports: u64,
 	pub compute_units_consumed: u64,
+	pub is_pump: bool,
 	pub slot: u64,
 	pub block_time: Option<i64>,
 	pub elapsed_ms: u128,
@@ -604,6 +605,9 @@ async fn fetch_and_parse(
 	// );
 	// if !pump_present { return Err(anyhow!("filtered: not pump.fun")); }
 
+	// Flag Pump.fun presence for builder selection
+	let is_pump = logs.iter().any(|l| l.contains(PUMP_FUN_PROGRAM_ID) || l.contains(PUMP_FUN_AMM_PROGRAM_ID));
+
 	// Instruction type parsing (may be absent on some providers)
 	let instruction_type = logs
 		.iter()
@@ -660,6 +664,7 @@ async fn fetch_and_parse(
 		tx_fee_lamports,
 		priority_lamports,
 		compute_units_consumed,
+		is_pump,
 		slot: tx.slot,
 		block_time: tx.block_time,
 		elapsed_ms,
