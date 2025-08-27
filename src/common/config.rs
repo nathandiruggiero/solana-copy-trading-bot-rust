@@ -26,6 +26,8 @@ pub struct Config {
     pub enable_raydium: bool,
     pub jupiter_quote_url: String,
     pub jupiter_swap_url: String,
+    pub min_buy_sol: f64,
+    pub skip_preflight: bool,
 }
 
 impl Config {
@@ -46,6 +48,8 @@ impl Config {
         let enable_raydium = env::var("ENABLE_RAYDIUM").unwrap_or_else(|_| "false".to_string()).to_lowercase() == "true";
         let jupiter_quote_url = env::var("JUPITER_QUOTE_URL").unwrap_or_else(|_| "https://quote-api.jup.ag/v6/quote".to_string());
         let jupiter_swap_url = env::var("JUPITER_SWAP_URL").unwrap_or_else(|_| "https://quote-api.jup.ag/v6/swap".to_string());
+        let min_buy_sol = env::var("MIN_BUY_SOL").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.02);
+        let skip_preflight = env::var("SKIP_PREFLIGHT").unwrap_or_else(|_| "false".to_string()).to_lowercase() == "true";
         
         let trade_percentage = trade_percentage_str.parse::<f64>().unwrap_or(1.0) / 100.0; // Convert percentage to decimal
         let slippage = slippage_str.parse::<f64>().unwrap_or(10.0) / 100.0; // Convert percentage to decimal
@@ -72,6 +76,8 @@ impl Config {
             enable_raydium,
             jupiter_quote_url,
             jupiter_swap_url,
+            min_buy_sol,
+            skip_preflight,
         }
     }
 }

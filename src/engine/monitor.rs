@@ -30,9 +30,9 @@ use crate::engine::swap::{
 	sign_and_send,
 };
 
-const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-const PUMP_FUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
-const METEORA_DBC_PROGRAM_ID: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
+#[allow(dead_code)] const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+#[allow(dead_code)] const PUMP_FUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+#[allow(dead_code)] const METEORA_DBC_PROGRAM_ID: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 #[derive(Debug, Clone)]
@@ -166,7 +166,7 @@ pub async fn copytrader(config: &Config) {
 													}
 												} else if config_ws.enable_raydium {
 													// Jupiter: SOL -> token
-													if let Ok(mut vtx) = fetch_jupiter_swap_tx(&http, &config_ws, &our_wallet_ws.to_string(), "So11111111111111111111111111111111111111112", mint_str, planned_lamports, (config_ws.slippage * 10_000.0) as u32).await {
+													if let Ok(mut vtx) = fetch_jupiter_swap_tx(&http, &config_ws, &our_wallet_ws.to_string(), "So11111111111111111111111111111111111111112", mint_str, planned_lamports.max(10_000), (config_ws.slippage * 10_000.0) as u32).await {
 														match sign_and_send(&rpc_for_ws, &mut vtx, &wallet_keypair).await {
 															Ok(copy_sig) => info!("[COPY-SENT] original={} copy_sig={}", md.signature, copy_sig),
 															Err(e) => error!("send error: {}", e),
@@ -236,7 +236,7 @@ pub async fn copytrader(config: &Config) {
 														let _ = sign_and_send(&rpc_for_ws, &mut vtx, &wallet_keypair).await;
 													} else if config_ws.enable_raydium {
 														// Jupiter: token -> SOL
-														if let Ok(mut vtx) = fetch_jupiter_swap_tx(&http, &config_ws, &our_wallet_ws.to_string(), mint_str, "So11111111111111111111111111111111111111112", in_amount_raw, (config_ws.slippage * 10_000.0) as u32).await {
+														if let Ok(mut vtx) = fetch_jupiter_swap_tx(&http, &config_ws, &our_wallet_ws.to_string(), mint_str, "So11111111111111111111111111111111111111112", in_amount_raw.max(1_000), (config_ws.slippage * 10_000.0) as u32).await {
 															let _ = sign_and_send(&rpc_for_ws, &mut vtx, &wallet_keypair).await;
 														}
 													}
@@ -848,7 +848,7 @@ fn start_pnl_logger(rpc_url: String, wallet: Pubkey, pnl_state: Arc<RwLock<BotPn
 	});
 }
 
-fn apply_our_trade_to_pnl(pnl_state: &Arc<RwLock<BotPnlState>>, md: &TransactionMetadata) {
+#[allow(dead_code)] fn apply_our_trade_to_pnl(pnl_state: &Arc<RwLock<BotPnlState>>, md: &TransactionMetadata) {
 	let mint_key = md.mint.clone().unwrap_or_else(|| "Unknown".to_string());
 	match md.direction.as_deref() {
 		Some("Buy") => {

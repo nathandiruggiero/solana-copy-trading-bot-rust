@@ -4,9 +4,10 @@ use bincode;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
+    commitment_config::{CommitmentConfig, CommitmentLevel},
     message::VersionedMessage,
     pubkey::Pubkey,
     signature::{Keypair, Signature, Signer},
@@ -16,7 +17,6 @@ use std::str::FromStr;
 
 use crate::common::config::Config;
 use serde_json::Value;
-use reqwest::StatusCode;
 
 /// Calculate lamports to spend for a buy based on wallet balance and trade percentage
 pub async fn calculate_buy_lamports(
@@ -26,6 +26,9 @@ pub async fn calculate_buy_lamports(
 ) -> Result<u64> {
     let balance = rpc.get_balance(wallet_pubkey).await?; // in lamports
     let mut to_spend = (balance as f64 * config.trade_percentage) as u64;
+    // Enforce minimum buy in lamports
+    let min_lamports = (config.min_buy_sol * 1_000_000_000.0) as u64;
+    if to_spend < min_lamports { to_spend = min_lamports.min(balance); }
     // keep small buffer for fees
     let fee_buffer: u64 = 5_000; // ~0.000005 SOL
     if to_spend > fee_buffer {
@@ -143,7 +146,7 @@ pub async fn fetch_jupiter_swap_tx(
 ) -> Result<VersionedTransaction> {
     // 1) Quote
     let url = format!(
-        "{}?inputMint={}&outputMint={}&amount={}&slippageBps={}&onlyDirectRoutes=false&asLegacyTransaction=false",
+        "{}?inputMint={}&outputMint={}&amount={}&slippageBps={}&onlyDirectRoutes=true&asLegacyTransaction=false",
         config.jupiter_quote_url,
         input_mint,
         output_mint,
@@ -154,14 +157,35 @@ pub async fn fetch_jupiter_swap_tx(
         "[JUP-QUOTE] {} input={} output={} amount={} bps={}",
         config.jupiter_quote_url, input_mint, output_mint, in_amount_raw, slippage_bps
     );
-    let quote_resp = http_client.get(&url).send().await?.error_for_status()?;
-    let quote_json: Value = quote_resp.json().await?;
+    let quote_resp = http_client.get(&url).send().await;
+    let quote_resp = match quote_resp {
+        Ok(r) => r,
+        Err(e) => {
+            error!("[JUP-QUOTE-ERR] http error: {}", e);
+            return Err(anyhow!(e));
+        }
+    };
+    if !quote_resp.status().is_success() {
+        let status = quote_resp.status();
+        let body = quote_resp.text().await.unwrap_or_default();
+        error!("[JUP-QUOTE-ERR] status={} body={}", status, body);
+        return Err(anyhow!(format!("jupiter quote error: {}", status)));
+    }
+    let quote_json: Value = match quote_resp.json().await {
+        Ok(j) => j,
+        Err(e) => {
+            error!("[JUP-QUOTE-ERR] json parse: {}", e);
+            return Err(anyhow!(e));
+        }
+    };
     let first_route = quote_json
         .get("data")
         .and_then(|d| d.as_array())
         .and_then(|arr| arr.first())
         .cloned()
         .ok_or_else(|| anyhow!("no jupiter route"))?;
+    let routes_len = quote_json.get("data").and_then(|d| d.as_array()).map(|a| a.len()).unwrap_or(0);
+    info!("[JUP-ROUTES] count={}", routes_len);
 
     // 2) Swap
     let mut swap_body = serde_json::Map::new();
@@ -169,23 +193,47 @@ pub async fn fetch_jupiter_swap_tx(
     swap_body.insert("userPublicKey".to_string(), Value::String(wallet.to_string()));
     swap_body.insert("wrapAndUnwrapSol".to_string(), Value::Bool(true));
     swap_body.insert("asLegacyTransaction".to_string(), Value::Bool(false));
-    swap_body.insert("useSharedAccounts".to_string(), Value::Bool(true));
+    swap_body.insert("useSharedAccounts".to_string(), Value::Bool(false));
+    swap_body.insert("dynamicComputeUnitLimit".to_string(), Value::Bool(true));
     // Optional: carry slippage explicitly
     swap_body.insert("slippageBps".to_string(), Value::Number(slippage_bps.into()));
+    // Optional: priority fee hint
+    let pri_lamports: u64 = match config.priority_fee_level.as_str() {
+        "low" => 0,
+        "medium" => 150_000,
+        "high" => 400_000,
+        "extreme" => 1_000_000,
+        _ => 0,
+    };
+    if pri_lamports > 0 {
+        swap_body.insert("prioritizationFeeLamports".to_string(), Value::Number((pri_lamports as u64).into()));
+    }
 
     info!(
         "[JUP-SWAP] {} wallet={} input={} output={} amount={}",
         config.jupiter_swap_url, wallet, input_mint, output_mint, in_amount_raw
     );
-    let swap_resp = http_client
+    info!("[JUP-SWAP] POST {}", config.jupiter_swap_url);
+    let swap_resp = match http_client
         .post(&config.jupiter_swap_url)
         .json(&Value::Object(swap_body))
         .send()
-        .await?
-        .error_for_status()?;
+        .await {
+            Ok(r) => r,
+            Err(e) => { error!("[JUP-SWAP-ERR] http error: {}", e); return Err(anyhow!(e)); }
+        };
+    if !swap_resp.status().is_success() {
+        let status = swap_resp.status();
+        let body = swap_resp.text().await.unwrap_or_default();
+        error!("[JUP-SWAP-ERR] status={} body={}", status, body);
+        return Err(anyhow!(format!("jupiter swap error: {}", status)));
+    }
     #[derive(Deserialize)]
     struct JupiterSwapResponse { #[serde(rename = "swapTransaction")] swap_tx: String }
-    let body: JupiterSwapResponse = swap_resp.json().await?;
+    let body: JupiterSwapResponse = match swap_resp.json().await {
+        Ok(j) => j,
+        Err(e) => { error!("[JUP-SWAP-ERR] json parse: {}", e); return Err(anyhow!(e)); }
+    };
     let data = general_purpose::STANDARD.decode(&body.swap_tx)?;
     info!("[JUP-RX] tx_bytes={} b64_len={}", data.len(), body.swap_tx.len());
     let tx: VersionedTransaction = bincode::deserialize(&data)?;
@@ -212,7 +260,15 @@ pub async fn sign_and_send(
     } else {
         tx.signatures[0] = payer_sig;
     }
-    let sig = rpc.send_transaction(tx).await?;
+    // Allow skipping preflight based on config through an env-derived flag
+    // We don't have config here; detect from env for simplicity
+    let skip = std::env::var("SKIP_PREFLIGHT").unwrap_or_else(|_| "false".to_string()).to_lowercase() == "true";
+    let cfg = RpcSendTransactionConfig {
+        skip_preflight: skip,
+        preflight_commitment: Some(CommitmentLevel::Processed),
+        ..RpcSendTransactionConfig::default()
+    };
+    let sig = rpc.send_transaction_with_config(tx, cfg).await?;
     info!("[COPY-SUBMIT] signature={}", sig);
     // best-effort confirmation
     let _ = rpc
